@@ -1,0 +1,41 @@
+# AWS 키
+*.pem
+*.key
+.aws/
+
+# 환경변수
+.env
+*.env
+
+# 로그 및 데이터
+logs/
+data/
+*.log
+*.json
+*.pcap
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# ML 모델 (용량 큰 파일)
+models/*.h5
+models/*.pkl
+models/*.pt
+
+# Docker
+.docker/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+tmp/
+temp/
