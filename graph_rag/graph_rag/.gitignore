@@ -1,0 +1,4 @@
+.env
+.venv
+gx_results/
+malware_date/
