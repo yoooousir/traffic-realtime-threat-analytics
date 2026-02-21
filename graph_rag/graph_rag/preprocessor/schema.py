@@ -1,6 +1,14 @@
 """
 schema.py (Session-Centric Version)
 Suricata Flows + Alerts + Zeek 로그를 Session 중심 Graph 구조로 변환
+
+anomaly_score 계산 로직(suricata, zeek)
+suricata || zeek
+상태 필드: flow_state (closed/established/new) || conn_state (S0/REJ/RSTO 등)
+트래픽 필드: pkts_toserver/toclient || orig_pkts/resp_pkts
+바이트 필드: bytes_toserver/toclient || orig_bytes/resp_bytes
+추가 지표: flow_reason (timeout) || service 누락 여부
+최고 단일 점수: S0 없음 (flow 기준) || S0/REJ → +30
 """
 
 import json
@@ -192,6 +200,69 @@ def _confidence(severity: int) -> int:
 
 # ── Suricata Flow 변환 (Alerts 병합 지원) ────────────────
 
+def calculate_anomaly_score(row: dict) -> int:
+    """
+    Suricata Flow 기반 Anomaly Score 계산 (0~100)
+    각 항목은 독립적 위협 지표이며, 가중치 합산 방식 적용
+
+항목: flow_state 비정상,      점수: +20,     탐지대상: bypassed등 우회 흔적
+항목: flow_state 누락,        점수: +10,     탐지대상: 데이터 이상 또는 조작
+항목: timeout 종료,           점수: +15,     탐지대상: SYN Flood, C2 장기 연결
+항목: 단방향 트래픽,           점수: +25,      탐지대상: 포트스캔, Null Session
+항목: 요청/응답 비율 극단,      점수: +15~20,   탐지대상: DDoS, Exfiltration
+항목: UDP/ICMP 대용량,        점수: +15,      탐지대상: Amplification Attack, Tunneling
+항목: 짧은 Duration + 대용량,  점수: +10,      탐지대상: 자동화 공격, 스캐너
+    """
+    anomaly_score = 0
+
+    pkts_toserver = row.get("pkts_toserver", 0)
+    pkts_toclient = row.get("pkts_toclient", 0)
+    bytes_toserver = row.get("bytes_toserver", 0)
+    bytes_toclient = row.get("bytes_toclient", 0)
+    flow_state = row.get("flow_state", "").lower()
+    flow_reason = row.get("flow_reason", "").lower()   # timeout / forced / shutdown
+    proto = row.get("proto", "").lower()
+    duration = row.get("duration", None)               # 초 단위 (있을 경우)
+
+    # ── 1. Flow 상태 이상 (+20) ──
+    # flow_state가 명시적으로 established/closed 가 아닌 경우만 비정상 처리
+    NORMAL_STATES = {"closed", "established", "new"}
+    if flow_state and flow_state not in NORMAL_STATES:
+        anomaly_score += 20  # e.g. "bypassed", "local_bypassed" 등
+    elif not flow_state:
+        anomaly_score += 10  # flow_state 자체가 없는 경우 (경미한 이상)
+
+    # ── 2. Flow 종료 원인 이상 (+15) ──
+    # timeout으로 끊긴 경우 → SYN Flood, 장기 C2 연결 등 의심
+    if "timeout" in flow_reason:
+        anomaly_score += 15
+
+    # ── 3. 단방향 트래픽 (+25) ──
+    # 서버→클라이언트 응답이 전혀 없는 경우 → SYN Scan, 포트스캔, Null Session
+    if pkts_toserver > 0 and pkts_toclient == 0:
+        anomaly_score += 25
+
+    # ── 4. 비대칭 트래픽 (+20) ──
+    # 응답 대비 요청이 극단적으로 많은 경우 → DDoS, Flood, Data Exfiltration
+    if pkts_toclient > 0 and pkts_toserver > 0:
+        ratio = pkts_toserver / pkts_toclient
+        if ratio > 10:      # 요청이 응답의 10배 이상 → DoS 패턴
+            anomaly_score += 20
+        elif ratio < 0.05:  # 응답이 요청의 20배 이상 → Exfiltration 패턴
+            anomaly_score += 15
+
+    # ── 5. 비정상적으로 큰 페이로드 (+15) ──
+    # UDP/ICMP에서 대용량 전송 → Amplification Attack, Tunneling
+    if proto in {"udp", "icmp"} and bytes_toserver > 100_000:
+        anomaly_score += 15
+
+    # ── 6. 극단적으로 짧은 Duration + 대용량 (+10) ──
+    # 빠른 연결 후 대량 전송 → 자동화 공격, 스캐너
+    if duration is not None and duration < 1 and (bytes_toserver + bytes_toclient) > 10_000:
+        anomaly_score += 10
+
+    return min(anomaly_score, 100)  # 최대 100 cap
+
 def from_suricata_flow(row: Dict, alert_map: Dict[str, List] = None) -> UnifiedEvent:
     """
     Suricata flow → Session-centric Graph
@@ -226,12 +297,12 @@ def from_suricata_flow(row: Dict, alert_map: Dict[str, List] = None) -> UnifiedE
     total_bytes = bytes_toserver + bytes_toclient
     
     # 이상 점수 계산
-    anomaly_score = 0
-    flow_state = row.get("flow_state", "").lower()
-    if "closed" not in flow_state:
-        anomaly_score += 20
-    if pkts_toserver > 0 and pkts_toclient == 0:
-        anomaly_score += 25
+    anomaly_score = calculate_anomaly_score(row)
+    # flow_state = row.get("flow_state", "").lower()
+    # if "closed" not in flow_state:
+    #     anomaly_score += 20
+    # if pkts_toserver > 0 and pkts_toclient == 0:
+    #     anomaly_score += 25
     
     # 기본 노드
     nodes = {
@@ -338,7 +409,7 @@ def from_suricata_flow(row: Dict, alert_map: Dict[str, List] = None) -> UnifiedE
         technique=attack.get("technique", ""),
         cve=attack.get("cve", ""),
         is_malicious=severity_numeric <= 2,
-        confidence=_confidence(severity_numeric) if has_alert else 20,
+        # confidence=_confidence(severity_numeric) if has_alert else 20,
         nodes=nodes,
         edges=edges,
         summary=f"[Flow] {src_ip} → {dest_ip} | {total_bytes} bytes" + 
@@ -348,6 +419,75 @@ def from_suricata_flow(row: Dict, alert_map: Dict[str, List] = None) -> UnifiedE
 
 
 # ── Zeek Connection 변환 ─────────────────────────────────
+def calculate_zeek_anomaly_score(row: dict) -> int:
+    """
+    Zeek Connection 기반 Anomaly Score 계산 (0~100)
+    Zeek conn 필드 기준: orig_h/resp_h, orig_bytes/resp_bytes, conn_state 등
+    """
+    anomaly_score = 0
+
+    conn_state  = row.get("conn_state", "")
+    orig_bytes  = int(float(row.get("orig_bytes", 0) or 0))
+    resp_bytes  = int(float(row.get("resp_bytes", 0) or 0))
+    orig_pkts   = int(float(row.get("orig_pkts", 0) or 0))
+    resp_pkts   = int(float(row.get("resp_pkts", 0) or 0))
+    proto       = row.get("proto", "").lower()
+    duration    = row.get("duration", None)
+    service     = row.get("service", "").lower()
+
+    # ── 1. conn_state 기반 이상 탐지 ──────────────────────────
+    # Zeek conn_state 의미:
+    #   S0  : SYN만 보내고 응답 없음 → 포트스캔
+    #   REJ : 연결 거부 (RST) → 닫힌 포트 스캔
+    #   RSTO: 서버가 RST로 종료 → 비정상 종료
+    #   RSTOS0: SYN 보냈으나 SYN-ACK 없이 RST → half-open 스캔
+    #   OTH : 핸드셰이크 없이 데이터 → 세션 하이재킹 가능성
+    HIGH_RISK_STATES   = {"S0", "REJ", "RSTOS0", "OTH"}
+    MEDIUM_RISK_STATES = {"RSTO", "RSTR", "SHR", "SHF"}
+
+    if conn_state in HIGH_RISK_STATES:
+        anomaly_score += 30
+    elif conn_state in MEDIUM_RISK_STATES:
+        anomaly_score += 15
+    elif not conn_state:
+        anomaly_score += 10  # conn_state 누락 자체가 이상
+
+    # ── 2. 단방향 트래픽 ──────────────────────────────────────
+    # 요청은 있으나 응답 바이트가 전혀 없음 → 스캔, Null Session
+    if orig_bytes > 0 and resp_bytes == 0:
+        anomaly_score += 25
+
+    # ── 3. 패킷 비대칭 ────────────────────────────────────────
+    # 응답 패킷 수 대비 요청이 극단적으로 많음 → DoS/Flood
+    if resp_pkts > 0 and orig_pkts > 0:
+        ratio = orig_pkts / resp_pkts
+        if ratio > 10:       # 요청 패킷이 응답의 10배 이상
+            anomaly_score += 20
+        elif ratio < 0.05:   # 응답이 요청의 20배 이상 → Exfiltration
+            anomaly_score += 15
+
+    # ── 4. 대용량 전송 이상 ───────────────────────────────────
+    # UDP/ICMP 대용량 → Amplification, DNS Tunneling
+    if proto in {"udp", "icmp"} and orig_bytes > 100_000:
+        anomaly_score += 15
+
+    # ── 5. 짧은 연결 + 대용량 ────────────────────────────────
+    # 자동화 스캐너, Burst 공격 패턴
+    try:
+        dur = float(duration) if duration is not None else None
+    except (ValueError, TypeError):
+        dur = None
+
+    if dur is not None and dur < 1.0 and (orig_bytes + resp_bytes) > 10_000:
+        anomaly_score += 10
+
+    # ── 6. 의심 서비스 포트 ───────────────────────────────────
+    # Zeek가 식별한 서비스가 없는 경우 (비표준 포트 통신)
+    if not service:
+        anomaly_score += 5
+
+    return min(anomaly_score, 100)
+
 
 def from_zeek_conn(row: Dict) -> UnifiedEvent:
     ts = row.get("ts", "")
@@ -373,13 +513,16 @@ def from_zeek_conn(row: Dict) -> UnifiedEvent:
         orig_bytes = resp_bytes = 0
         duration = 0.0
     
+    # anomaly_score = 30 if suspicious else 0
+    # if orig_bytes > 0 and resp_bytes == 0:
+    #     anomaly_score += 20
+    anomaly_score = calculate_zeek_anomaly_score(row)
     conn_state = row.get("conn_state", "")
-    suspicious = conn_state in ("REJ", "RSTO", "RSTOS0", "S0")
-    severity = 3 if suspicious else 4
-    
-    anomaly_score = 30 if suspicious else 0
-    if orig_bytes > 0 and resp_bytes == 0:
-        anomaly_score += 20
+
+    # suspicious 판단을 conn_state 기반으로 통일
+    HIGH_RISK_STATES = {"S0", "REJ", "RSTOS0", "OTH"}
+    suspicious = conn_state in HIGH_RISK_STATES
+    severity = 2 if suspicious else (3 if anomaly_score > 30 else 4)
     
     return UnifiedEvent(
         session_id=session_id,
@@ -400,9 +543,9 @@ def from_zeek_conn(row: Dict) -> UnifiedEvent:
         conn_state=conn_state,
         severity_numeric=severity,
         severity=SEVERITY_MAP.get(severity, "low"),
-        anomaly_score=min(anomaly_score, 100),
+        anomaly_score=anomaly_score,
         is_malicious=suspicious,
-        confidence=40 if suspicious else 20,
+        # confidence=_confidence(severity),
         nodes={
             "src_host": {"id": src_host_id, "type": "host", "ip": src_ip},
             "dst_host": {"id": dst_host_id, "type": "host", "ip": dest_ip},
@@ -486,7 +629,7 @@ def from_zeek_dns(row: Dict) -> UnifiedEvent:
         severity_numeric=severity,
         severity=SEVERITY_MAP.get(severity, "low"),
         is_malicious=is_suspicious,
-        confidence=60 if is_suspicious else 20,
+        # confidence=60 if is_suspicious else 20,
         nodes=nodes,
         edges=edges,
         summary=f"[DNS] {src_ip} → {query}",
@@ -542,7 +685,7 @@ def from_zeek_http(row: Dict) -> UnifiedEvent:
         severity_numeric=severity,
         severity=SEVERITY_MAP.get(severity, "low"),
         is_malicious=suspicious_ua,
-        confidence=60 if suspicious_ua else 20,
+        # confidence=60 if suspicious_ua else 20,
         nodes={
             "src_host": {"id": src_host_id, "type": "host", "ip": src_ip},
             "dst_host": {"id": dst_host_id, "type": "host", "ip": dest_ip},

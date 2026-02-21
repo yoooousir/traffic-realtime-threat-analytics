@@ -173,7 +173,6 @@ def build_prompt(
   "predicted_next": "다음 공격 단계 예측",
   "related_threat": "연관 공격자 또는 캠페인 정보 (없으면 null)",
   "mitigation": ["대응 방안 1", "대응 방안 2", "대응 방안 3"],
-  "confidence": 0,
   "is_new_ip": {str(not ip_history.get("known", False)).lower()},
   "session_analysis": "Session 단위 분석 요약 (Flow 패턴, Alert 연계)"
 }}""".strip()
@@ -256,15 +255,17 @@ class RAGExecutor:
             return {"raw_response": raw, "parse_error": str(e)}
 
     def _fallback_result(self, error: str) -> Dict[str, Any]:
+        # return {
+        #     "attack_summary":  f"분석 실패: {error}",
+        #     "severity_reason": "API 오류",
+        #     "attack_stage":    "Unknown",
+        #     "predicted_next":  None,
+        #     "related_threat":  None,
+        #     "mitigation":      ["수동 검토 필요"],
+        #     "is_new_ip":       True,
+        #     "session_analysis": "분석 불가"
+        # }
         return {
-            "attack_summary":  f"분석 실패: {error}",
-            "severity_reason": "API 오류",
-            "attack_stage":    "Unknown",
-            "predicted_next":  None,
-            "related_threat":  None,
-            "mitigation":      ["수동 검토 필요"],
-            #"confidence":      0,
-            "is_new_ip":       True,
-            "session_analysis": "분석 불가"
+            "attack_summary":  f"분석 실패: {error}"
         }
 
