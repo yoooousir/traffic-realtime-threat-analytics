@@ -251,7 +251,8 @@ python main.py visualize \
 |------|------|------|------|------|------|------|------|------|
 | groq/llama-3.1-8b-instant | 0.1085 | 0.6818 | 0.4545 | 1.00 | T | 0.94 | 0.000079 | 0.7894 |
 | groq/llama-3.3-70b-versatile | 0.0655 | 0.5561 | 0.4550 | 1.00 | T | 1.45 | 0.000890 | 0.7692 |
-__gemini-2.0-flash (Google), gpt-4o-mini (OpenAI) 추가 예정__
+| gemini-2.0-flash (Google) | | | | | | | |
+| gpt-4o-mini (OpenAI) | | | | | | | |
 
 ### 현재 최적 모델
 
