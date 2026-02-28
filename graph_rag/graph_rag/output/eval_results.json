@@ -1,0 +1,57 @@
+{
+  "results": [
+    {
+      "model": "llama-3.1-8b-instant",
+      "provider": "groq",
+      "bleu": 0.1085,
+      "rouge1_f": 0.6818,
+      "rouge2_f": 0.4769,
+      "rougeL_f": 0.4545,
+      "field_coverage": 1.0,
+      "json_valid": true,
+      "mitre_valid": true,
+      "latency_sec": 0.939,
+      "input_tokens": 1149,
+      "output_tokens": 270,
+      "cost_usd": 7.905e-05,
+      "raw_response": "{\n  \"attack_summary\": \"시그니처 ET INFO Wget User Agent, 카테고리 Attempted Information Leak, Flow 통계 Total Bytes 9,184 bytes로 정보 유출 시도 공격이 감지되었습니다.\",\n  \"severity_reason\": \"Alert Count 1개, Anomaly Score 0/100, 카테고리 Attempted Information Leak로 높은 위험도 (High, level 2)를 판단했습니다.\",\n  \"attack_stage\": \"Initial Access\",\n  \"predicted_next\": \"Execution\",\n  \"related_threat\": \"연관 공격자 IP: 147.185.132.149, 167.94.145.34, 91.196.152.75, 198.235.24.117, 91.196.152.177\",\n  \"mitigation\": [\"시그니처 ET INFO Wget User Agent에 대한 로그 분석 및 모니터링\", \"출발지 IP 204.76.203.206에 대한 IP 블록\", \"시스템 보안 패치 및 업데이트\"],\n  \"is_new_ip\": false,\n  \"session_analysis\": \"Session Alert 연계 및 Flow 패턴으로 정보 유출 시도 공격이 감지되었습니다. 분석 가능한 Session 데이터 없음\"\n}",
+      "error": "",
+      "overall_score": 0.7894
+    },
+    {
+      "model": "llama-3.3-70b-versatile",
+      "provider": "groq",
+      "bleu": 0.0655,
+      "rouge1_f": 0.5561,
+      "rouge2_f": 0.3371,
+      "rougeL_f": 0.455,
+      "field_coverage": 1.0,
+      "json_valid": true,
+      "mitre_valid": true,
+      "latency_sec": 1.452,
+      "input_tokens": 1149,
+      "output_tokens": 269,
+      "cost_usd": 0.00089042,
+      "raw_response": "{\n  \"attack_summary\": \"ET INFO Wget User Agent 시그니처와 Attempted Information Leak 카테고리로 인해 정보 유출 시도를 감지하였으며, Flow 통계상 9,184 bytes의 데이터가 교환되었습니다.\",\n  \"severity_reason\": \"Alert 개수가 1개이고 Anomaly Score가 0/100으로 낮지만, 카테고리가 Attempted Information Leak이고 위험도가 High로 판단됩니다.\",\n  \"attack_stage\": \"Discovery\",\n  \"predicted_next\": \"Collection\",\n  \"related_threat\": [\"147.185.132.149\", \"167.94.145.34\", \"91.196.152.75\", \"198.235.24.117\", \"91.196.152.177\"],\n  \"mitigation\": [\"외부로의 데이터 전송을 제한하는 방화벽 규칙 적용\", \"사용자 에이전트 문자열을 분석하여 의심스러운 요청을 차단\", \"서버와 클라이언트 간의 통신을 암호화\"],\n  \"is_new_ip\": false,\n  \"session_analysis\": \"Session Alert 연계 및 Flow 패턴 분석 결과, established 상태의 Flow에서 10개의 패킷이 교환되었으며, 총 9,184 bytes의 데이터가 전송되었습니다.\"\n}",
+      "error": "",
+      "overall_score": 0.7692
+    }
+  ],
+  "best_model": {
+    "model": "llama-3.1-8b-instant",
+    "provider": "groq",
+    "bleu": 0.1085,
+    "rouge1_f": 0.6818,
+    "rouge2_f": 0.4769,
+    "rougeL_f": 0.4545,
+    "field_coverage": 1.0,
+    "json_valid": true,
+    "mitre_valid": true,
+    "latency_sec": 0.939,
+    "input_tokens": 1149,
+    "output_tokens": 270,
+    "cost_usd": 7.905e-05,
+    "raw_response": "{\n  \"attack_summary\": \"시그니처 ET INFO Wget User Agent, 카테고리 Attempted Information Leak, Flow 통계 Total Bytes 9,184 bytes로 정보 유출 시도 공격이 감지되었습니다.\",\n  \"severity_reason\": \"Alert Count 1개, Anomaly Score 0/100, 카테고리 Attempted Information Leak로 높은 위험도 (High, level 2)를 판단했습니다.\",\n  \"attack_stage\": \"Initial Access\",\n  \"predicted_next\": \"Execution\",\n  \"related_threat\": \"연관 공격자 IP: 147.185.132.149, 167.94.145.34, 91.196.152.75, 198.235.24.117, 91.196.152.177\",\n  \"mitigation\": [\"시그니처 ET INFO Wget User Agent에 대한 로그 분석 및 모니터링\", \"출발지 IP 204.76.203.206에 대한 IP 블록\", \"시스템 보안 패치 및 업데이트\"],\n  \"is_new_ip\": false,\n  \"session_analysis\": \"Session Alert 연계 및 Flow 패턴으로 정보 유출 시도 공격이 감지되었습니다. 분석 가능한 Session 데이터 없음\"\n}",
+    "error": ""
+  }
+}
