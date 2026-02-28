@@ -1,8 +1,10 @@
 """
-RAG 모듈 (Session-Centric Version)
+rag/rag_module.py (Session-Centric v2 - 할루시네이션 방지 강화)
 - Session 정보 + Flow 통계 포함
-- Groq LLM 호출 (llama-3.3-70b-versatile)
+- Groq LLM 호출 (llama-3.3-70b-versatile 기본)
 - JSON 파싱 및 구조화
+- 할루시네이션 방지 + 보안 도메인 기반 프롬프트 강화
+- MITRE ATT&CK 단계 유효성 후처리 검증
 """
 
 import json
@@ -17,9 +19,18 @@ logger = logging.getLogger(__name__)
 
 SEVERITY_LABEL = {1: "Critical", 2: "High", 3: "Medium", 4: "Low"}
 
+# MITRE ATT&CK 단계 (LLM 참조용 - 근거 없이 추론 금지)
+MITRE_STAGES = [
+    "Reconnaissance", "Resource Development", "Initial Access",
+    "Execution", "Persistence", "Privilege Escalation",
+    "Defense Evasion", "Credential Access", "Discovery",
+    "Lateral Movement", "Collection", "Command and Control",
+    "Exfiltration", "Impact"
+]
+
 
 # ============================================================
-# 1. 프롬프트 템플릿 (Session-Centric)
+# 1. 프롬프트 템플릿 (Session-Centric, 할루시네이션 방지)
 # ============================================================
 
 def build_prompt(
@@ -28,126 +39,138 @@ def build_prompt(
     ip_history: Dict[str, Any],
 ) -> str:
     severity_label = SEVERITY_LABEL.get(packet.get("severity_numeric", 4), "Unknown")
-    source = packet.get("source", "unknown")
-    session_type = packet.get("session_type", source)
+    source         = packet.get("source", "unknown")
+    session_type   = packet.get("session_type", source)
+    is_new_ip      = not ip_history.get("known", False)
 
-    # ── Session 정보 (추가) ──
-    session_info = f"""
-[Session 정보]
+    # ── Session 정보 ──
+    session_info = f"""[Session 정보]
   Session ID   : {packet.get('session_id', 'N/A')}
   Session Type : {session_type}
   Has Alert    : {'예' if packet.get('has_alert') else '아니오'}"""
-    
-    if packet.get('has_alert'):
-        session_info += f"""
-  Alert Count  : {packet.get('alert_count', 0)}개"""
 
-    # ── Flow 통계 (Suricata Flow인 경우) ──
+    if packet.get('has_alert'):
+        session_info += f"\n  Alert Count  : {packet.get('alert_count', 0)}개"
+
+    # ── Flow 통계 ──
     flow_stats = ""
     if source == "suricata_flow":
         flow_stats = f"""
 [Flow 통계]
-  Flow State    : {packet.get('flow_state', '-')}
+  Flow State    : {packet.get('flow_state', 'N/A')}
   Total Bytes   : {packet.get('total_bytes', 0):,} bytes
   Packets       : ↑{packet.get('pkts_toserver', 0)} / ↓{packet.get('pkts_toclient', 0)}
   Anomaly Score : {packet.get('anomaly_score', 0)}/100"""
-
-    # ── 그래프 탐색 결과 포맷 ──
-    alerts_text = "탐지된 Alert 없음"
-    if graph_context.get("alerts"):
-        lines = []
-        for a in graph_context["alerts"]:
-            line = (
-                f"  - [{a.get('severity','?')}] {a.get('signature','')} "
-                f"| 카테고리: {a.get('category','')} "
-                f"| 시간: {a.get('timestamp', '-')}"
-            )
-            lines.append(line)
-        alerts_text = "\n".join(lines[:10])  # 최대 10개
-        if len(graph_context["alerts"]) > 10:
-            alerts_text += f"\n  ... 외 {len(graph_context['alerts']) - 10}건"
-
-    targets_text = "타겟 IP 없음"
-    if graph_context.get("targeted_ips"):
-        lines = [
-            f"  - {t['dest_ip']} (공격 횟수: {t['attack_count']}, "
-            f"최고 위험도: {t['min_severity']})"
-            for t in graph_context["targeted_ips"]
-        ]
-        targets_text = "\n".join(lines)
-
-    related_text = "연관 공격자 없음"
-    if graph_context.get("related_attackers"):
-        lines = [
-            f"  - {r['related_ip']} (공유 Alert 수: {r['shared_alerts']})"
-            for r in graph_context["related_attackers"]
-        ]
-        related_text = "\n".join(lines)
-
-    dns_text = ""
-    if graph_context.get("dns_queries"):
-        dns_text = "\n[DNS 질의 도메인]\n" + "\n".join(
-            f"  - {d}" for d in graph_context["dns_queries"][:10]
-        )
-        if len(graph_context["dns_queries"]) > 10:
-            dns_text += f"\n  ... 외 {len(graph_context['dns_queries']) - 10}개"
-
-    url_text = ""
-    if graph_context.get("http_urls"):
-        url_text = "\n[HTTP 접근 URL]\n" + "\n".join(
-            f"  - {u}" for u in graph_context["http_urls"][:10]
-        )
-        if len(graph_context["http_urls"]) > 10:
-            url_text += f"\n  ... 외 {len(graph_context['http_urls']) - 10}개"
-
-    # ── IP 이력 ──
-    if ip_history.get("known"):
-        history_text = (
-            f"  - 누적 Alert 수: {ip_history['total_alerts']}\n"
-            f"  - 최고 위험도: {ip_history['highest_severity']}\n"
-            f"  - 위협 카테고리: {', '.join(ip_history.get('categories', [])) or '-'}"
-        )
-    else:
-        history_text = "  - 신규 IP (그래프에 이력 없음)"
 
     # ── 소스별 추가 컨텍스트 ──
     extra = ""
     if source == "zeek_conn":
         extra = f"""
 [Zeek Connection 정보]
-  프로토콜      : {packet.get('proto','-')}
-  연결 상태     : {packet.get('conn_state','-')}
-  송신/수신     : {packet.get('orig_bytes',0):,} / {packet.get('resp_bytes',0):,} bytes
+  프로토콜      : {packet.get('proto', 'N/A')}
+  연결 상태     : {packet.get('conn_state', 'N/A')}
+  송신/수신     : {packet.get('orig_bytes', 0):,} / {packet.get('resp_bytes', 0):,} bytes
   Anomaly Score : {packet.get('anomaly_score', 0)}/100"""
     elif source == "zeek_dns":
         extra = f"""
 [Zeek DNS 정보]
-  질의 도메인   : {packet.get('dns_query','-')}
-  질의 타입     : {packet.get('dns_qtype','-')}
-  응답 값       : {packet.get('dns_answers','-')}
+  질의 도메인   : {packet.get('dns_query', 'N/A')}
+  질의 타입     : {packet.get('dns_qtype', 'N/A')}
+  응답 값       : {packet.get('dns_answers', 'N/A')}
   Suspicion Score: {packet.get('suspicion_score', 0)}/100"""
     elif source == "zeek_http":
         extra = f"""
 [Zeek HTTP 정보]
-  메서드        : {packet.get('http_method','-')}
-  호스트        : {packet.get('http_host','-')}
-  URI           : {packet.get('http_uri','-')}
-  User-Agent    : {packet.get('http_user_agent','-')[:80]}
-  응답 코드     : {packet.get('http_status',0)}
+  메서드        : {packet.get('http_method', 'N/A')}
+  호스트        : {packet.get('http_host', 'N/A')}
+  URI           : {packet.get('http_uri', 'N/A')}
+  User-Agent    : {str(packet.get('http_user_agent', 'N/A'))[:80]}
+  응답 코드     : {packet.get('http_status', 'N/A')}
   Risk Score    : {packet.get('risk_score', 0)}/100"""
 
+    # ── 그래프 탐색 결과 ──
+    # Alert 목록
+    if graph_context.get("alerts"):
+        alerts_lines = []
+        for a in graph_context["alerts"][:10]:
+            alerts_lines.append(
+                f"  - [{a.get('severity','?')}] {a.get('signature','N/A')} "
+                f"| 카테고리: {a.get('category','N/A')} "
+                f"| 시간: {a.get('timestamp', 'N/A')}"
+            )
+        alerts_text = "\n".join(alerts_lines)
+        if len(graph_context["alerts"]) > 10:
+            alerts_text += f"\n  ... 외 {len(graph_context['alerts']) - 10}건"
+    else:
+        alerts_text = "  [데이터 없음 - Alert 기반 추론 금지]"
+
+    # 타겟 IP
+    if graph_context.get("targeted_ips"):
+        targets_text = "\n".join(
+            f"  - {t['dest_ip']} (공격 횟수: {t['attack_count']}, "
+            f"최고 위험도: {t['min_severity']})"
+            for t in graph_context["targeted_ips"]
+        )
+    else:
+        targets_text = "  [데이터 없음]"
+
+    # 연관 공격자
+    if graph_context.get("related_attackers"):
+        related_text = "\n".join(
+            f"  - {r['related_ip']} (공유 Alert 수: {r['shared_alerts']})"
+            for r in graph_context["related_attackers"]
+        )
+    else:
+        related_text = "  [데이터 없음 - 연관 공격자 추론 금지]"
+
+    # DNS
+    dns_text = ""
+    if graph_context.get("dns_queries"):
+        dns_list = "\n".join(f"  - {d}" for d in graph_context["dns_queries"][:10])
+        if len(graph_context["dns_queries"]) > 10:
+            dns_list += f"\n  ... 외 {len(graph_context['dns_queries']) - 10}개"
+        dns_text = f"\n[DNS 질의 도메인]\n{dns_list}"
+
+    # HTTP URL
+    url_text = ""
+    if graph_context.get("http_urls"):
+        url_list = "\n".join(f"  - {u}" for u in graph_context["http_urls"][:10])
+        if len(graph_context["http_urls"]) > 10:
+            url_list += f"\n  ... 외 {len(graph_context['http_urls']) - 10}개"
+        url_text = f"\n[HTTP 접근 URL]\n{url_list}"
+
+    # IP 이력
+    if ip_history.get("known"):
+        history_text = (
+            f"  - 누적 Alert 수: {ip_history['total_alerts']}\n"
+            f"  - 최고 위험도: {ip_history['highest_severity']}\n"
+            f"  - 위협 카테고리: {', '.join(ip_history.get('categories', [])) or '[분류 없음]'}"
+        )
+    else:
+        history_text = "  - 신규 IP (그래프에 이력 없음) - 과거 행위 추론 금지"
+
+    # MITRE 단계 목록 (참조용)
+    mitre_ref = ", ".join(MITRE_STAGES)
+
     prompt = f"""당신은 네트워크 보안 관제 전문가입니다.
-아래 Session 기반 패킷 정보와 그래프 분석 결과를 바탕으로 공격을 분석하고,
-반드시 아래 JSON 형식으로만 응답하세요. JSON 외 다른 텍스트는 절대 포함하지 마세요.
+아래 제공된 데이터만을 근거로 분석하세요.
+
+## 핵심 규칙 (반드시 준수)
+1. 제공된 데이터에 없는 정보는 절대 추론하거나 생성하지 마세요.
+2. "[데이터 없음]"으로 표시된 항목은 null 또는 빈 배열로 처리하세요.
+3. MITRE ATT&CK 단계는 반드시 아래 목록에서만 선택하세요: {mitre_ref}
+4. 시그니처, IP, 카테고리 등 고유값은 반드시 제공된 값 그대로 사용하세요.
+5. 대응 방안은 탐지된 공격 유형에 맞는 실제 보안 조치만 작성하세요 (일반론 금지).
+6. is_new_ip는 반드시 {str(is_new_ip).lower()} 로 고정하세요 (변경 금지).
 
 === 현재 이벤트 정보 ===
 {session_info}
-출발지 IP  : {packet.get('src_ip','N/A')}
-목적지 IP  : {packet.get('dest_ip','N/A')}
-위험도     : {severity_label} (level {packet.get('severity_numeric','N/A')})
-카테고리   : {packet.get('category','-')}
-시그니처   : {packet.get('signature','-')}
-타임스탬프 : {packet.get('timestamp','N/A')}
+출발지 IP  : {packet.get('src_ip', 'N/A')}
+목적지 IP  : {packet.get('dest_ip', 'N/A')}
+위험도     : {severity_label} (level {packet.get('severity_numeric', 'N/A')})
+카테고리   : {packet.get('category', 'N/A')}
+시그니처   : {packet.get('signature', 'N/A')}
+타임스탬프 : {packet.get('timestamp', 'N/A')}
 {flow_stats}
 {extra}
 
@@ -165,16 +188,18 @@ def build_prompt(
 [출발지 IP 과거 이력]
 {history_text}
 
-=== 응답 형식 (JSON만 출력) ===
+=== 응답 형식 ===
+아래 JSON만 출력하세요. 마크다운, 코드블록, 설명 텍스트 절대 금지.
+
 {{
-  "attack_summary": "공격 행위를 1~2문장으로 요약 (Session 정보와 Flow 통계 고려)",
-  "severity_reason": "위험도가 이 수준인 이유 (Alert + Anomaly Score 종합)",
-  "attack_stage": "MITRE ATT&CK 기준 현재 공격 단계",
-  "predicted_next": "다음 공격 단계 예측",
-  "related_threat": "연관 공격자 또는 캠페인 정보 (없으면 null)",
-  "mitigation": ["대응 방안 1", "대응 방안 2", "대응 방안 3"],
-  "is_new_ip": {str(not ip_history.get("known", False)).lower()},
-  "session_analysis": "Session 단위 분석 요약 (Flow 패턴, Alert 연계)"
+  "attack_summary": "위 데이터에 있는 시그니처·카테고리·Flow 수치를 직접 인용하여 공격 행위를 1~2문장으로 기술",
+  "severity_reason": "제공된 Alert 개수·Anomaly Score·카테고리를 근거로 위험도 판단 이유 기술 (수치 직접 인용)",
+  "attack_stage": "MITRE ATT&CK 단계 1개 (위 목록에서만 선택, 근거 없으면 null)",
+  "predicted_next": "현재 단계 이후 MITRE ATT&CK 상 다음 단계 (위 목록에서만 선택, 근거 없으면 null)",
+  "related_threat": "연관 공격자 데이터가 있을 경우에만 기술, 없으면 null",
+  "mitigation": ["탐지된 공격 유형({packet.get('category', 'N/A')})에 특화된 대응 방안 1", "대응 방안 2", "대응 방안 3"],
+  "is_new_ip": {str(is_new_ip).lower()},
+  "session_analysis": "Session Alert 연계 및 Flow 패턴을 제공된 수치 기반으로 기술 (데이터 없으면 '분석 가능한 Session 데이터 없음')"
 }}""".strip()
 
     return prompt
@@ -200,7 +225,7 @@ class RAGExecutor:
         packet: Dict[str, Any],
         graph_context: Dict[str, Any],
         ip_history: Dict[str, Any],
-        max_tokens: int = 1536,  # Session 정보 추가로 토큰 증가
+        max_tokens: int = 1536,
     ) -> Dict[str, Any]:
         prompt = build_prompt(packet, graph_context, ip_history)
         logger.debug(f"Prompt length: {len(prompt)} chars")
@@ -209,22 +234,26 @@ class RAGExecutor:
             response = self.client.chat.completions.create(
                 model=self.model,
                 max_tokens=max_tokens,
-                temperature=0.1,
+                temperature=0.0,       # 재현성 최대화, 할루시네이션 억제
                 messages=[
                     {
                         "role": "system",
                         "content": (
                             "You are a cybersecurity analyst specializing in "
-                            "Session-based network threat analysis. "
-                            "Always respond with valid JSON only. "
-                            "No markdown, no explanation, no code blocks."
+                            "Session-based network threat analysis using real observed data. "
+                            "STRICT RULES: "
+                            "1) Output valid JSON only — no markdown, no explanation, no code blocks. "
+                            "2) Never invent, infer, or hallucinate data not explicitly provided. "
+                            "3) If data is missing, use null or empty array — never fabricate values. "
+                            "4) MITRE ATT&CK stages must only come from the provided list in the prompt. "
+                            "5) is_new_ip must match the value specified in the prompt exactly."
                         ),
                     },
                     {"role": "user", "content": prompt},
                 ],
             )
             raw_text = response.choices[0].message.content.strip()
-            result   = self._parse_response(raw_text)
+            result   = self._parse_and_validate(raw_text, packet, ip_history)
 
         except Exception as e:
             logger.error(f"Groq API error: {e}")
@@ -236,36 +265,57 @@ class RAGExecutor:
             "model":      self.model,
         }
 
-    def _parse_response(self, raw: str) -> Dict[str, Any]:
-        # ```json ... ``` 블록 제거
+    def _parse_and_validate(
+        self,
+        raw: str,
+        packet: Dict[str, Any],
+        ip_history: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """JSON 파싱 후 핵심 필드 후처리 검증"""
+        # 코드블록 제거
         if "```" in raw:
-            parts = raw.split("```")
-            for part in parts:
-                part = part.strip()
-                if part.startswith("json"):
-                    part = part[4:]
-                part = part.strip()
+            for part in raw.split("```"):
+                part = part.strip().lstrip("json").strip()
                 if part.startswith("{"):
                     raw = part
                     break
+
         try:
-            return json.loads(raw.strip())
+            result = json.loads(raw.strip())
         except json.JSONDecodeError as e:
-            logger.warning(f"JSON 파싱 실패: {e} | raw[:200]: {raw[:200]}")
+            logger.warning(f"JSON 파싱 실패: {e} | raw[:300]: {raw[:300]}")
             return {"raw_response": raw, "parse_error": str(e)}
 
-    def _fallback_result(self, error: str) -> Dict[str, Any]:
-        # return {
-        #     "attack_summary":  f"분석 실패: {error}",
-        #     "severity_reason": "API 오류",
-        #     "attack_stage":    "Unknown",
-        #     "predicted_next":  None,
-        #     "related_threat":  None,
-        #     "mitigation":      ["수동 검토 필요"],
-        #     "is_new_ip":       True,
-        #     "session_analysis": "분석 불가"
-        # }
-        return {
-            "attack_summary":  f"분석 실패: {error}"
-        }
+        # ── 후처리 검증: is_new_ip 강제 교정 ──
+        is_new_ip = not ip_history.get("known", False)
+        if result.get("is_new_ip") != is_new_ip:
+            logger.warning(
+                f"is_new_ip 불일치 교정: LLM={result.get('is_new_ip')} → 실제={is_new_ip}"
+            )
+            result["is_new_ip"] = is_new_ip
 
+        # ── 후처리 검증: MITRE 단계 유효성 ──
+        for field in ("attack_stage", "predicted_next"):
+            val = result.get(field)
+            if val and val not in MITRE_STAGES:
+                logger.warning(f"{field} 유효하지 않은 MITRE 단계: '{val}' → null 처리")
+                result[field] = None
+
+        # ── 후처리 검증: mitigation 리스트 확인 ──
+        if not isinstance(result.get("mitigation"), list):
+            result["mitigation"] = ["수동 검토 필요"]
+
+        return result
+
+    def _fallback_result(self, error: str) -> Dict[str, Any]:
+        return {
+            "attack_summary":   f"분석 실패: {error}",
+            "severity_reason":  "API 오류로 인한 분석 불가",
+            "attack_stage":     None,
+            "predicted_next":   None,
+            "related_threat":   None,
+            "mitigation":       ["수동 검토 필요"],
+            "is_new_ip":        None,
+            "session_analysis": "분석 불가",
+            "parse_error":      error,
+        }

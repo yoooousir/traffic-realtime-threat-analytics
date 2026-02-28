@@ -1,4 +1,5 @@
 .env
 .venv
+.bak
 gx_results/
 malware_date/

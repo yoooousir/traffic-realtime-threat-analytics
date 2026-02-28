@@ -215,10 +215,16 @@ def calculate_anomaly_score(row: dict) -> int:
     """
     anomaly_score = 0
 
-    pkts_toserver = row.get("pkts_toserver", 0)
-    pkts_toclient = row.get("pkts_toclient", 0)
-    bytes_toserver = row.get("bytes_toserver", 0)
-    bytes_toclient = row.get("bytes_toclient", 0)
+     # ── 타입 변환 추가 ──
+    pkts_toserver  = int(float(row.get("pkts_toserver",  0) or 0))
+    pkts_toclient  = int(float(row.get("pkts_toclient",  0) or 0))
+    bytes_toserver = int(float(row.get("bytes_toserver", 0) or 0))
+    bytes_toclient = int(float(row.get("bytes_toclient", 0) or 0))
+    flow_state  = row.get("flow_state",  "").lower()
+    flow_reason = row.get("flow_reason", "").lower()
+    proto       = row.get("proto",       "").lower()
+    duration    = row.get("duration",    None)
+    
     flow_state = row.get("flow_state", "").lower()
     flow_reason = row.get("flow_reason", "").lower()   # timeout / forced / shutdown
     proto = row.get("proto", "").lower()

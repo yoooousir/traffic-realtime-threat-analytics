@@ -22,3 +22,9 @@ python-dotenv>=1.0.0
 groq>=1.0.0
 openai>=2.21.0
 google-genai
+
+# 평가 모듈
+nltk
+rouge-score
+networkx
+matplotlib
