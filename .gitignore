@@ -1,7 +1,12 @@
 # AWS 키
 *.pem
+*.avro
 *.key
+*.csv
 .aws/
+
+# gitignore
+tpotce/
 
 # 환경변수
 .env
