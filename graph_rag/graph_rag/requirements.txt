@@ -28,3 +28,10 @@ nltk
 rouge-score
 networkx
 matplotlib
+
+# aws s3
+boto3
+awscli
+
+# avro
+fastavro

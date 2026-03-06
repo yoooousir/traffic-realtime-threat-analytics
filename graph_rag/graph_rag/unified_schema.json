@@ -1,0 +1,604 @@
+{
+  "description": "Session-Centric 통합 이벤트 스키마. Suricata(flow+alert) + Zeek(conn/dns/http) → 단일 JSONL 레코드",
+  "type": "object",
+
+  "properties": {
+    "session_id": {
+      "type": "string",
+      "description": "세션 고유 식별자. Suricata=flow_id(str변환), Zeek conn=community_id, Zeek dns/http=uid. 소스 간 같은 세션이면 동일값",
+      "source_mapping": {
+        "suricata_flow":  "flow_id (int→str)",
+        "suricata_alert": "flow_id (int→str)",
+        "zeek_conn":      "community_id (있을 때) or uid",
+        "zeek_dns":       "uid",
+        "zeek_http":      "uid"
+      },
+      "example": "1498025280416847"
+    },
+    "session_type": {
+      "type": "string",
+      "description": "이벤트 소스 유형",
+      "enum": ["suricata_flow", "suricata_alert", "zeek_connection", "zeek_dns", "zeek_http"]
+    },
+    "event_uuid": {
+      "type": "string",
+      "description": "uuid5(DNS, ts+src_ip+dest_ip) 기반 이벤트 고유 ID",
+      "format": "uuid"
+    },
+    "source": {
+      "type": "string",
+      "description": "원본 로그 소스명",
+      "enum": ["suricata_flow", "suricata_alert", "zeek_conn", "zeek_dns", "zeek_http"]
+    },
+    "timestamp": {
+      "type": "string",
+      "description": "이벤트 발생 시각. Suricata=ISO8601, Zeek=Unix timestamp string",
+      "source_mapping": {
+        "suricata": "timestamp (2026-03-02T08:20:48.962577+0000)",
+        "zeek":     "ts (1772427595.239543)"
+      }
+    },
+    "date": {
+      "type": "string",
+      "description": "파티션 키용 날짜 (YYYY-MM-DD). timestamp에서 추출",
+      "format": "date",
+      "example": "2026-03-02"
+    },
+    "src_ip": {
+      "type": "string",
+      "description": "출발지 IP",
+      "source_mapping": {
+        "suricata": "src_ip",
+        "zeek":     "id.orig_h"
+      }
+    },
+    "dest_ip": {
+      "type": "string",
+      "description": "목적지 IP",
+      "source_mapping": {
+        "suricata": "dest_ip",
+        "zeek":     "id.resp_h"
+      }
+    },
+    "src_port": {
+      "type": "integer",
+      "description": "출발지 포트",
+      "source_mapping": {
+        "suricata": "src_port",
+        "zeek":     "id.orig_p"
+      }
+    },
+    "dest_port": {
+      "type": "integer",
+      "description": "목적지 포트",
+      "source_mapping": {
+        "suricata": "dest_port",
+        "zeek":     "id.resp_p"
+      }
+    },
+    "proto": {
+      "type": "string",
+      "description": "전송 프로토콜 (소문자 통일)",
+      "examples": ["tcp", "udp", "icmp"]
+    },
+    "direction": {
+      "type": "string",
+      "description": "IP 기반 트래픽 방향. schema.py _direction() 함수로 산출",
+      "enum": ["inbound", "outbound", "internal", "external"]
+    },
+
+    
+    "app_proto": {
+      "type": ["string", "null"],
+      "description": "Suricata가 식별한 애플리케이션 프로토콜",
+      "examples": ["dns", "tls", "http", "failed"]
+    },
+    "flow_state": {
+      "type": ["string", "null"],
+      "description": "flow.state. 정상: new/established/closed, 비정상: bypassed 등",
+      "source_mapping": { "suricata_flow": "flow.state" }
+    },
+    "flow_reason": {
+      "type": ["string", "null"],
+      "description": "flow.reason. timeout/shutdown/forced",
+      "source_mapping": { "suricata_flow": "flow.reason" }
+    },
+    "flow_alerted": {
+      "type": ["boolean", "null"],
+      "description": "flow.alerted. 해당 flow에서 alert 발생 여부",
+      "source_mapping": { "suricata_flow": "flow.alerted" }
+    },
+    "pkts_toserver": {
+      "type": ["integer", "null"],
+      "description": "클라이언트→서버 패킷 수",
+      "source_mapping": {
+        "suricata": "flow.pkts_toserver",
+        "zeek_conn": "orig_pkts"
+      }
+    },
+    "pkts_toclient": {
+      "type": ["integer", "null"],
+      "description": "서버→클라이언트 패킷 수",
+      "source_mapping": {
+        "suricata": "flow.pkts_toclient",
+        "zeek_conn": "resp_pkts"
+      }
+    },
+    "bytes_toserver": {
+      "type": ["integer", "null"],
+      "description": "클라이언트→서버 바이트",
+      "source_mapping": {
+        "suricata": "flow.bytes_toserver",
+        "zeek_conn": "orig_bytes"
+      }
+    },
+    "bytes_toclient": {
+      "type": ["integer", "null"],
+      "description": "서버→클라이언트 바이트",
+      "source_mapping": {
+        "suricata": "flow.bytes_toclient",
+        "zeek_conn": "resp_bytes"
+      }
+    },
+    "total_bytes": {
+      "type": ["integer", "null"],
+      "description": "bytes_toserver + bytes_toclient 합산. 파생 필드"
+    },
+    "anomaly_score": {
+      "type": "integer",
+      "description": "0~100. schema.py calculate_anomaly_score() / calculate_zeek_anomaly_score() 산출",
+      "minimum": 0,
+      "maximum": 100
+    },
+
+    
+    "has_alert": {
+      "type": "boolean",
+      "description": "해당 세션에 Suricata alert가 1건 이상 존재하면 true"
+    },
+    "alert_count": {
+      "type": "integer",
+      "description": "동일 flow_id에서 발생한 alert 총 건수",
+      "minimum": 0
+    },
+    "signature": {
+      "type": ["string", "null"],
+      "description": "가장 심각한 alert의 signature 문자열",
+      "source_mapping": { "suricata_alert": "alert.signature" },
+      "example": "ET INFO Reserved Internal IP Traffic"
+    },
+    "signature_id": {
+      "type": ["string", "null"],
+      "description": "md5(signature:category)[:16] 해시. Neo4j Signature 노드 ID",
+      "source_mapping": { "suricata_alert": "alert.signature_id" }
+    },
+    "alert_action": {
+      "type": ["string", "null"],
+      "description": "Suricata alert 처리 결과",
+      "enum": ["allowed", "blocked", null],
+      "source_mapping": { "suricata_alert": "alert.action" }
+    },
+    "category": {
+      "type": ["string", "null"],
+      "description": "Suricata alert 카테고리",
+      "source_mapping": { "suricata_alert": "alert.category" },
+      "example": "Potentially Bad Traffic"
+    },
+    "severity_numeric": {
+      "type": "integer",
+      "description": "Suricata severity 원본값. 1=critical, 2=high, 3=medium, 4=low. Zeek는 anomaly_score 기반 환산",
+      "minimum": 1,
+      "maximum": 4
+    },
+    "severity": {
+      "type": "string",
+      "description": "severity_numeric → 레이블 변환. SEVERITY_MAP 적용",
+      "enum": ["critical", "high", "medium", "low"]
+    },
+    "misp_category": {
+      "type": ["string", "null"],
+      "description": "MISP_CATEGORY_MAP 기반 위협 분류",
+      "examples": ["network-activity", "reconnaissance", "malware", "exploit-kit", "intrusion-attempts"]
+    },
+
+    "uid": {
+      "type": ["string", "null"],
+      "description": "Zeek 연결 고유 ID. dns/http의 session_id 기반으로도 활용",
+      "source_mapping": { "zeek": "uid" }
+    },
+    "community_id": {
+      "type": ["string", "null"],
+      "description": "Zeek conn에만 존재. Suricata flow_id와 세션 매핑 키",
+      "source_mapping": { "zeek_conn": "community_id" },
+      "example": "1:AiX8vAnCNaXzBQApAG0qwqxNGig="
+    },
+    "service": {
+      "type": ["string", "null"],
+      "description": "Zeek가 식별한 서비스명",
+      "source_mapping": { "zeek_conn": "service" },
+      "examples": ["ssl", "dns", "http"]
+    },
+    "conn_state": {
+      "type": ["string", "null"],
+      "description": "Zeek 연결 상태. S0/REJ=high risk, SF=정상",
+      "source_mapping": { "zeek_conn": "conn_state" },
+      "examples": ["SF", "S0", "REJ", "RSTO", "OTH"]
+    },
+    "duration": {
+      "type": ["number", "null"],
+      "description": "연결 지속 시간 (초)",
+      "source_mapping": {
+        "suricata_flow": "flow.age",
+        "zeek_conn": "duration"
+      }
+    },
+    "orig_bytes": {
+      "type": ["integer", "null"],
+      "description": "Zeek orig→resp 바이트 (≈ bytes_toserver)",
+      "source_mapping": { "zeek_conn": "orig_bytes" }
+    },
+    "resp_bytes": {
+      "type": ["integer", "null"],
+      "description": "Zeek resp→orig 바이트 (≈ bytes_toclient)",
+      "source_mapping": { "zeek_conn": "resp_bytes" }
+    },
+    "orig_pkts": {
+      "type": ["integer", "null"],
+      "source_mapping": { "zeek_conn": "orig_pkts" }
+    },
+    "resp_pkts": {
+      "type": ["integer", "null"],
+      "source_mapping": { "zeek_conn": "resp_pkts" }
+    },
+    "missed_bytes": {
+      "type": ["integer", "null"],
+      "source_mapping": { "zeek_conn": "missed_bytes" }
+    },
+    "history": {
+      "type": ["string", "null"],
+      "description": "Zeek 연결 히스토리 플래그 (예: ShADadFf)",
+      "source_mapping": { "zeek_conn": "history" }
+    },
+
+    "dns_query": {
+      "type": ["string", "null"],
+      "description": "DNS 질의 도메인",
+      "source_mapping": { "zeek_dns": "query" }
+    },
+    "dns_qtype": {
+      "type": ["string", "null"],
+      "description": "DNS 질의 타입명",
+      "source_mapping": { "zeek_dns": "qtype_name" },
+      "examples": ["A", "AAAA", "PTR", "MX"]
+    },
+    "dns_rcode": {
+      "type": ["string", "null"],
+      "description": "DNS 응답 코드",
+      "source_mapping": { "zeek_dns": "rcode_name" },
+      "examples": ["NOERROR", "NXDOMAIN"]
+    },
+    "dns_answers": {
+      "type": ["string", "null"],
+      "description": "DNS 응답 레코드 목록. vector → comma-joined string",
+      "source_mapping": { "zeek_dns": "answers" }
+    },
+    "dns_rejected": {
+      "type": ["boolean", "null"],
+      "description": "DNS 질의 거부 여부",
+      "source_mapping": { "zeek_dns": "rejected" }
+    },
+    "suspicion_score": {
+      "type": ["integer", "null"],
+      "description": "DNS 의심도 점수 (0~100). 긴 도메인/DGA TLD 등 기준",
+      "minimum": 0,
+      "maximum": 100
+    },
+
+    "http_method": {
+      "type": ["string", "null"],
+      "source_mapping": { "zeek_http": "method" },
+      "examples": ["GET", "POST", "CONNECT"]
+    },
+    "http_host": {
+      "type": ["string", "null"],
+      "source_mapping": { "zeek_http": "host" }
+    },
+    "http_uri": {
+      "type": ["string", "null"],
+      "source_mapping": { "zeek_http": "uri" }
+    },
+    "http_user_agent": {
+      "type": ["string", "null"],
+      "source_mapping": { "zeek_http": "user_agent" }
+    },
+    "http_status": {
+      "type": ["integer", "null"],
+      "description": "HTTP 응답 코드. Zeek에서 '-' 값은 null 처리",
+      "source_mapping": { "zeek_http": "status_code" }
+    },
+    "http_referrer": {
+      "type": ["string", "null"],
+      "source_mapping": { "zeek_http": "referrer" }
+    },
+    "http_version": {
+      "type": ["string", "null"],
+      "source_mapping": { "zeek_http": "version" },
+      "examples": ["1.0", "1.1"]
+    },
+    "http_request_len": {
+      "type": ["integer", "null"],
+      "source_mapping": { "zeek_http": "request_body_len" }
+    },
+    "http_response_len": {
+      "type": ["integer", "null"],
+      "source_mapping": { "zeek_http": "response_body_len" }
+    },
+    "http_mime_type": {
+      "type": ["string", "null"],
+      "description": "응답 MIME 타입",
+      "source_mapping": { "zeek_http": "resp_mime_types" }
+    },
+    "risk_score": {
+      "type": ["integer", "null"],
+      "description": "HTTP 위험도 점수 (0~100). User-Agent 패턴 기반",
+      "minimum": 0,
+      "maximum": 100
+    },
+
+    "tactic": {
+      "type": ["string", "null"],
+      "description": "MITRE ATT&CK Tactic. ATTACK_KEYWORDS 매핑 기반",
+      "examples": ["discovery", "initial_access", "credential_access", "command_and_control"]
+    },
+    "technique": {
+      "type": ["string", "null"],
+      "description": "MITRE ATT&CK Technique",
+      "examples": ["network_service_scanning", "exploit_public_facing_application", "brute_force"]
+    },
+    "tool": {
+      "type": ["string", "null"],
+      "description": "탐지된 공격 도구명",
+      "examples": ["nmap"]
+    },
+    "cve": {
+      "type": ["string", "null"],
+      "description": "signature에서 추출된 CVE 번호",
+      "pattern": "^CVE-\\d{4}-\\d+$"
+    },
+    "is_malicious": {
+      "type": "boolean",
+      "description": "악성 여부. Suricata: severity<=2, Zeek conn: HIGH_RISK_STATES, Zeek http: suspicious UA"
+    },
+    "confidence": {
+      "type": "integer",
+      "description": "탐지 신뢰도 (0~100). _confidence(severity) 함수 기반",
+      "minimum": 0,
+      "maximum": 100
+    },
+
+    "_rag": {
+      "description": "── RAG / 자연어 요약 ────────────────────────────────────────────────",
+      "type": "null"
+    },
+    "summary": {
+      "type": "string",
+      "description": "이벤트 자연어 요약. RAG 검색 및 LLM 컨텍스트 입력용",
+      "examples": [
+        "[Flow] 8.8.4.4 → 10.0.2.15 | 249 bytes",
+        "[Alert] 10.0.2.2 → 10.0.2.15 | ET INFO Reserved Internal IP Traffic",
+        "[Conn] 71.6.232.22 → 10.0.2.15 | tcp | SF",
+        "[DNS] 10.0.2.15 → 8.8.8.8.in-addr.arpa",
+        "[HTTP] 45.88.110.97 → http://10.0.2.15/index.php?s=/index/..."
+      ]
+    },
+    "mitigation": {
+      "type": "string",
+      "description": "대응 권고 문자열. anomaly_score/is_malicious 기반 자동 생성",
+      "examples": [
+        "Monitor suspicious flow",
+        "Block suspicious UA",
+        "Check domain reputation"
+      ]
+    },
+
+    "_graph": {
+      "description": "── Graph 구조 (Neo4j 적재용) ────────────────────────────────────────",
+      "type": "null"
+    },
+    "nodes": {
+      "type": "object",
+      "description": "Neo4j 노드 맵. key=노드 역할명, value=노드 속성",
+      "properties": {
+        "src_host": {
+          "type": "object",
+          "description": "출발지 Host 노드",
+          "properties": {
+            "id":    { "type": "string", "description": "md5(host:ip)[:16]" },
+            "type":  { "type": "string", "enum": ["host"] },
+            "ip":    { "type": "string" },
+            "label": { "type": "string" }
+          }
+        },
+        "dst_host": {
+          "type": "object",
+          "description": "목적지 Host 노드",
+          "properties": {
+            "id":    { "type": "string" },
+            "type":  { "type": "string", "enum": ["host"] },
+            "ip":    { "type": "string" },
+            "label": { "type": "string" }
+          }
+        },
+        "service": {
+          "type": "object",
+          "description": "Service 노드 (dest_ip:dest_port/proto)",
+          "properties": {
+            "id":       { "type": "string" },
+            "type":     { "type": "string", "enum": ["service"] },
+            "address":  { "type": "string", "description": "ip:port/proto" },
+            "ip":       { "type": "string" },
+            "port":     { "type": ["string","integer"] },
+            "protocol": { "type": "string" },
+            "label":    { "type": "string" }
+          }
+        },
+        "signature_{id}": {
+          "type": "object",
+          "description": "Signature 노드. has_alert=true일 때만 생성. 복수 가능",
+          "properties": {
+            "id":        { "type": "string" },
+            "type":      { "type": "string", "enum": ["signature"] },
+            "signature": { "type": "string" },
+            "category":  { "type": "string" },
+            "severity":  { "type": "integer" },
+            "label":     { "type": "string" }
+          }
+        },
+        "domain": {
+          "type": "object",
+          "description": "Domain 노드 (zeek_dns 전용)",
+          "properties": {
+            "id":     { "type": "string" },
+            "type":   { "type": "string", "enum": ["domain"] },
+            "domain": { "type": "string" },
+            "label":  { "type": "string" }
+          }
+        },
+        "url": {
+          "type": "object",
+          "description": "URL 노드 (zeek_http 전용)",
+          "properties": {
+            "id":    { "type": "string" },
+            "type":  { "type": "string", "enum": ["url"] },
+            "url":   { "type": "string" },
+            "label": { "type": "string" }
+          }
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "description": "Neo4j 관계 목록. from/to=노드 ID, type=관계 타입",
+      "items": {
+        "type": "object",
+        "required": ["from", "to", "type"],
+        "properties": {
+          "from": { "type": "string", "description": "출발 노드 ID (session_id 또는 node id)" },
+          "to":   { "type": "string", "description": "도착 노드 ID" },
+          "type": {
+            "type": "string",
+            "enum": ["SRC", "DST", "TARGETS", "RUNS", "TRIGGERED", "QUERIES", "ACCESSES", "RESOLVED_TO"],
+            "description": "SRC: 세션→출발Host, DST: 세션→목적Host, TARGETS: 세션→Service, RUNS: Host→Service, TRIGGERED: 세션→Signature, QUERIES: 세션→Domain, ACCESSES: 세션→URL, RESOLVED_TO: Domain→Host"
+          }
+        }
+      }
+    },
+    "nodes_json": {
+      "type": ["string", "null"],
+      "description": "nodes 객체를 JSON 직렬화한 문자열. Delta Lake / Parquet 저장용"
+    },
+    "edges_json": {
+      "type": ["string", "null"],
+      "description": "edges 배열을 JSON 직렬화한 문자열. Delta Lake / Parquet 저장용"
+    }
+  },
+
+  "required": [
+    "session_id", "session_type", "event_uuid", "source",
+    "timestamp", "date", "src_ip", "dest_ip", "proto", "direction",
+    "anomaly_score", "severity_numeric", "severity",
+    "has_alert", "alert_count", "is_malicious",
+    "summary", "mitigation", "nodes", "edges"
+  ],
+
+  "_source_field_mapping": {
+    "description": "소스별 원본 필드 → 공통 스키마 매핑 요약",
+    "suricata_flow": {
+      "timestamp":      "timestamp",
+      "flow_id(str)":   "session_id",
+      "src_ip":         "src_ip",
+      "src_port":       "src_port",
+      "dest_ip":        "dest_ip",
+      "dest_port":      "dest_port",
+      "proto(lower)":   "proto",
+      "app_proto":      "app_proto",
+      "flow.state":     "flow_state",
+      "flow.reason":    "flow_reason",
+      "flow.alerted":   "flow_alerted",
+      "flow.pkts_toserver":  "pkts_toserver",
+      "flow.pkts_toclient":  "pkts_toclient",
+      "flow.bytes_toserver": "bytes_toserver",
+      "flow.bytes_toclient": "bytes_toclient"
+    },
+    "suricata_alert": {
+      "timestamp":             "timestamp",
+      "flow_id(str)":          "session_id",
+      "alert.signature":       "signature",
+      "alert.signature_id":    "signature_id (hash로 재생성)",
+      "alert.category":        "category",
+      "alert.severity":        "severity_numeric",
+      "alert.action":          "alert_action",
+      "direction":             "(원본 to_server/to_client → net_direction으로 IP 기반 재계산)",
+      "flow.pkts_toserver":    "pkts_toserver",
+      "flow.bytes_toserver":   "bytes_toserver"
+    },
+    "zeek_conn": {
+      "ts":            "timestamp",
+      "uid":           "uid",
+      "community_id":  "community_id / session_id",
+      "id.orig_h":     "src_ip",
+      "id.orig_p":     "src_port",
+      "id.resp_h":     "dest_ip",
+      "id.resp_p":     "dest_port",
+      "proto":         "proto",
+      "service":       "service",
+      "duration":      "duration",
+      "orig_bytes":    "orig_bytes / bytes_toserver",
+      "resp_bytes":    "resp_bytes / bytes_toclient",
+      "conn_state":    "conn_state",
+      "orig_pkts":     "orig_pkts / pkts_toserver",
+      "resp_pkts":     "resp_pkts / pkts_toclient",
+      "missed_bytes":  "missed_bytes",
+      "history":       "history"
+    },
+    "zeek_dns": {
+      "ts":          "timestamp",
+      "uid":         "uid / session_id",
+      "id.orig_h":   "src_ip",
+      "id.resp_h":   "dest_ip",
+      "query":       "dns_query",
+      "qtype_name":  "dns_qtype",
+      "rcode_name":  "dns_rcode",
+      "answers":     "dns_answers (vector→comma string)",
+      "rejected":    "dns_rejected"
+    },
+    "zeek_http": {
+      "ts":                 "timestamp",
+      "uid":                "uid / session_id",
+      "id.orig_h":          "src_ip",
+      "id.resp_h":          "dest_ip",
+      "method":             "http_method",
+      "host":               "http_host",
+      "uri":                "http_uri",
+      "user_agent":         "http_user_agent",
+      "status_code":        "http_status (float '-'→null)",
+      "referrer":           "http_referrer ('-'→null)",
+      "version":            "http_version",
+      "request_body_len":   "http_request_len",
+      "response_body_len":  "http_response_len",
+      "resp_mime_types":    "http_mime_type (vector→first item)"
+    }
+  },
+
+  "_null_handling": {
+    "description": "소스별 null 표현 처리 규칙",
+    "zeek_tsv": {
+      "'-'":       "null (unset_field)",
+      "'(empty)'": "빈 문자열 '' (set_separator 없음)"
+    },
+    "suricata_json": {
+      "키 자체 없음": "null로 처리",
+      "flow_id":      "int64 → str 변환 (Python float 정밀도 손실 방지)"
+    }
+  }
+}
