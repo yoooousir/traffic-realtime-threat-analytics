@@ -7,8 +7,9 @@ Suricata + Zeek 로그를 통합하여 Session-Centric JSONL로 변환
       ├── "flow_start": ""
       ├── "flow_end": ""
       └── "timeline" : [
-          ├── ts, source(suricata, zeek_conn, zeek_dns, zeek_http 중 1), 해당 source의 각종 필드
-          └── ts, source(suricata, zeek_conn, zeek_dns, zeek_http 중 1), 해당 source의 각종 필드
+          ├── ts, source(suricata, zeek_conn, zeek_dns, zeek_http 중 1), 해당 source의 각종 필드 ...
+          └── ts, source(suricata, zeek_conn, zeek_dns, zeek_http 중 1), 해당 source의 각종 필드 ...
+           ...
           ]
 
 최종 출력: JSONL
