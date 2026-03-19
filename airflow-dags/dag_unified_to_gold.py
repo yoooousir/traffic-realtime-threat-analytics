@@ -3,19 +3,26 @@ dag_unified_to_gold.py
 S3 unified_events.parquet → session_gold / entity_gold / relation_gold 전처리 DAG
 
 Pipeline:
-  [fetch_from_s3]      ← S3에서 unified_events.parquet 다운로드 (5분 주기)
+  [fetch_from_s3]      ← S3 ETag 체크 → skip XCom 전달 (다운로드 없음)
        ↓
-  [parquet_to_jsonl]   ← parquet → unified_events.jsonl 변환
+  [parquet_to_jsonl]   ← S3 parquet 직접 읽기 → JSONL 변환 → S3 업로드
        ↓
-  [validate_input]     ← JSONL 파일 존재 및 행 수 검증
+  [validate_input]     ← S3에서 JSONL 다운로드 → 행 수 검증
        ↓
-  [extract_sessions]   ← unified_events.jsonl 행별 파싱 → session_gold.jsonl
+  [extract_sessions]   ← S3에서 JSONL 읽기 → session_gold → S3 업로드
        ↓
-  [extract_entities]   ← session_gold 기반 IP·Domain·Alert 집계 → entity_gold.jsonl
+  [extract_entities]   ← S3에서 session_gold + JSONL 읽기 → entity_gold → S3 업로드
        ↓
-  [extract_relations]  ← session_gold + entity_gold 기반 관계 추출 → relation_gold.jsonl
+  [extract_relations]  ← S3에서 session_gold + JSONL 읽기 → relation_gold → S3 업로드
        ↓
-  [report_stats]       ← 3개 gold 파일 요약 통계 로그
+  [report_stats]       ← S3에서 3개 gold 파일 읽기 → 요약 통계 로그
+
+[변경 사항]
+  - 모든 태스크가 로컬 파일 대신 S3에서 직접 읽고 S3에 저장
+  - EKS Pod 간 로컬 파일시스템 공유 불가 문제 해결
+  - parquet_to_jsonl: numpy 타입 직렬화 오류 수정 (_convert 함수 추가)
+  - fetch_from_s3: ETag 체크만 수행, 실제 다운로드 제거
+  - S3 gold 파일 경로: gold/session_gold.jsonl, gold/entity_gold.jsonl, gold/relation_gold.jsonl
 
 스키마:
   session_gold  : session_id, community_id, src_ip, dst_ip, dst_port,
@@ -40,6 +47,9 @@ Author : Linda
 
 from __future__ import annotations
 
+from airflow.sdk import Asset  # Airflow 3
+
+import io
 import json
 import logging
 import hashlib
@@ -53,14 +63,16 @@ import boto3
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 
-# ── S3 설정 (환경에 맞게 수정) ───────────────────────────────────────────────
-S3_BUCKET        = "malware-project-bucket"                        # S3 버킷명
-S3_KEY           = "unified_events.parquet"     # S3 오브젝트 경로
-AWS_REGION       = "ap-northeast-2"                      # 리전
-# AWS 자격증명은 환경변수(AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY) 또는
-# Airflow Connection(conn_id="aws_default") 으로 관리 권장
+# ── S3 설정 ───────────────────────────────────────────────────────────────────
+S3_BUCKET        = "malware-project-bucket"
+S3_KEY           = "unified_events.parquet"
+S3_JSONL_KEY     = "unified_events.jsonl"          # [변경] JSONL도 S3에 저장
+S3_SESSION_KEY   = "gold/session_gold.jsonl"        # [변경] gold 파일 S3 경로
+S3_ENTITY_KEY    = "gold/entity_gold.jsonl"
+S3_RELATION_KEY  = "gold/relation_gold.jsonl"
+AWS_REGION       = "ap-northeast-2"
 
-# ── 로컬 경로 설정 ────────────────────────────────────────────────────────────
+# ── 로컬 임시 경로 (태스크 내부에서만 사용, Pod 재시작 시 사라짐) ───────────
 DATA_DIR     = Path("/opt/airflow/data")
 PARQUET_PATH = DATA_DIR / "unified_events.parquet"
 INPUT_PATH   = DATA_DIR / "unified_events.jsonl"
@@ -69,99 +81,129 @@ SESSION_OUT  = OUTPUT_DIR / "session_gold.jsonl"
 ENTITY_OUT   = OUTPUT_DIR / "entity_gold.jsonl"
 RELATION_OUT = OUTPUT_DIR / "relation_gold.jsonl"
 
+# ── ETag 캐시 경로 ────────────────────────────────────────────────────────────
+ETAG_PATH    = DATA_DIR / ".last_etag"
+
+# Asset 선언 (URI는 논리적 식별자)
+GOLD_SESSION_ASSET  = Asset("s3://malware-project-bucket/gold/session_gold.jsonl")
+GOLD_ENTITY_ASSET   = Asset("s3://malware-project-bucket/gold/entity_gold.jsonl")
+GOLD_RELATION_ASSET = Asset("s3://malware-project-bucket/gold/relation_gold.jsonl")
+
 logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Task 0-1 : fetch_from_s3
+# 공통 S3 헬퍼
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _s3_client():
+    """boto3 S3 클라이언트 반환 (Airflow Connection aws_default 사용)"""
+    return boto3.client("s3")
+
+
+def _s3_read_jsonl(s3_key: str) -> list[dict]:
+    """S3에서 JSONL 파일을 읽어 list[dict] 반환"""                         # [추가]
+    s3 = _s3_client()
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
+    lines = obj["Body"].read().decode("utf-8").splitlines()
+    return [json.loads(line) for line in lines if line.strip()]
+
+
+def _s3_write_jsonl(s3_key: str, records: list[dict]) -> None:
+    """list[dict]를 JSONL 형식으로 S3에 업로드"""                           # [추가]
+    s3 = _s3_client()
+    body = "\n".join(json.dumps(r, ensure_ascii=False) for r in records) + "\n"
+    s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=body.encode("utf-8"))
+    logger.info("S3 업로드 완료: s3://%s/%s (%d 레코드)", S3_BUCKET, s3_key, len(records))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Task 0-1 : fetch_from_s3  [변경] 다운로드 제거 → ETag 체크만 수행
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_from_s3(**ctx) -> None:
     """
-    S3에서 unified_events.parquet 를 로컬로 다운로드.
-
-    변경 없으면 스킵:
-      S3 ETag vs 로컬에 저장된 마지막 ETag 비교 → 동일하면 skip_flag XCom 전달
+    S3 parquet 파일의 ETag를 확인해 변경 여부를 XCom으로 전달.
+    실제 다운로드는 하지 않음 (각 태스크가 직접 S3에서 읽음).           # [변경]
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    etag_path = DATA_DIR / ".last_etag"
 
-    s3 = boto3.client("s3", region_name=AWS_REGION) # .env에 있는 자격증명 자동 사용
+    s3 = _s3_client()
 
     # S3 오브젝트 메타데이터로 ETag 확인
     head = s3.head_object(Bucket=S3_BUCKET, Key=S3_KEY)
     s3_etag = head["ETag"].strip('"')
 
     # 이전 ETag와 비교
-    if etag_path.exists():
-        last_etag = etag_path.read_text().strip()
+    if ETAG_PATH.exists():
+        last_etag = ETAG_PATH.read_text().strip()
         if last_etag == s3_etag:
-            logger.info("S3 파일 변경 없음 (ETag=%s) — 다운로드 스킵", s3_etag)
+            logger.info("S3 파일 변경 없음 (ETag=%s) — 처리 스킵", s3_etag)
             ctx["ti"].xcom_push(key="skip", value=True)
             return
 
-    # 다운로드
-    logger.info("S3 다운로드 시작: s3://%s/%s", S3_BUCKET, S3_KEY)
-    s3.download_file(S3_BUCKET, S3_KEY, str(PARQUET_PATH))
-    etag_path.write_text(s3_etag)
-    logger.info("다운로드 완료 → %s (ETag=%s)", PARQUET_PATH, s3_etag)
+    ETAG_PATH.write_text(s3_etag)
+    logger.info("S3 파일 변경 감지 (ETag=%s) — 처리 시작", s3_etag)
     ctx["ti"].xcom_push(key="skip", value=False)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Task 0-2 : parquet_to_jsonl
+# Task 0-2 : parquet_to_jsonl  [변경] S3 직접 읽기 + numpy 직렬화 수정
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parquet_to_jsonl(**ctx) -> None:
     """
-    unified_events.parquet → unified_events.jsonl 변환.
-
-    fetch_from_s3 에서 skip=True 를 받으면 변환도 스킵
-    (이미 최신 JSONL 이 로컬에 존재하는 경우).
-
-    Parquet 스키마 가정:
-      - timeline 컬럼: JSON 직렬화된 문자열 또는 list[dict]
-      - 나머지 컬럼: community_id, flow_start, flow_end,
-                    is_threat, threat_level, alert_count
+    S3의 unified_events.parquet → JSONL 변환 후 S3에 업로드.             # [변경]
+    fetch_from_s3 에서 skip=True 이면 변환 스킵.
     """
     import pandas as pd
+    import numpy as np
 
     skip = ctx["ti"].xcom_pull(task_ids="fetch_from_s3", key="skip")
-    if skip and INPUT_PATH.exists():
+    if skip:
         logger.info("S3 변경 없음 — parquet 변환 스킵")
         return
 
-    if not PARQUET_PATH.exists():
-        raise FileNotFoundError(f"Parquet 파일 없음: {PARQUET_PATH}")
-
-    logger.info("Parquet 로드: %s", PARQUET_PATH)
-    df = pd.read_parquet(PARQUET_PATH)
+    # [변경] 로컬 파일 대신 S3에서 직접 읽기
+    logger.info("S3에서 parquet 직접 로드: s3://%s/%s", S3_BUCKET, S3_KEY)
+    s3 = _s3_client()
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=S3_KEY)
+    df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
     logger.info("  행 수: %d / 컬럼: %s", len(df), list(df.columns))
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    count = 0
-    with open(INPUT_PATH, "w", encoding="utf-8") as f:
-        for _, row in df.iterrows():
-            record = row.to_dict()
+    # [추가] numpy 타입 → Python 기본 타입 변환 함수
+    def _convert(v):
+        if isinstance(v, float) and v != v:   # NaN
+            return None
+        if isinstance(v, np.integer):
+            return int(v)
+        if isinstance(v, np.floating):
+            return None if np.isnan(v) else float(v)
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        if isinstance(v, np.bool_):
+            return bool(v)
+        return v
 
-            # timeline 컬럼이 문자열로 저장된 경우 파싱
-            if isinstance(record.get("timeline"), str):
-                try:
-                    record["timeline"] = json.loads(record["timeline"])
-                except json.JSONDecodeError:
-                    record["timeline"] = []
+    records = []
+    for _, row in df.iterrows():
+        record = row.to_dict()
 
-            # NaN → None 정리
-            record = {
-                k: (None if (isinstance(v, float) and v != v) else v)
-                for k, v in record.items()
-            }
+        # timeline 컬럼이 문자열로 저장된 경우 파싱
+        if isinstance(record.get("timeline"), str):
+            try:
+                record["timeline"] = json.loads(record["timeline"])
+            except json.JSONDecodeError:
+                record["timeline"] = []
 
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            count += 1
+        # [변경] numpy 타입 포함 전체 변환
+        record = {k: _convert(v) for k, v in record.items()}
+        records.append(record)
 
-    logger.info("parquet_to_jsonl 완료 — %d 행 → %s", count, INPUT_PATH)
-    ctx["ti"].xcom_push(key="jsonl_rows", value=count)
+    # [변경] 로컬 저장 대신 S3에 직접 업로드
+    _s3_write_jsonl(S3_JSONL_KEY, records)
+    logger.info("parquet_to_jsonl 완료 — %d 행 → s3://%s/%s", len(records), S3_BUCKET, S3_JSONL_KEY)
+    ctx["ti"].xcom_push(key="jsonl_rows", value=len(records))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -169,10 +211,6 @@ def parquet_to_jsonl(**ctx) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _make_session_id(community_id: str | None, idx: int) -> str:
-    """
-    community_id가 있으면 SHA-1 앞 8자리, 없으면 seq 번호로 session_id 생성.
-    예) s_a1b2c3d4  /  s_orphan_0042
-    """
     if community_id:
         h = hashlib.sha1(community_id.encode()).hexdigest()[:8]
         return f"s_{h}"
@@ -180,7 +218,6 @@ def _make_session_id(community_id: str | None, idx: int) -> str:
 
 
 def _get(ev: dict, *keys: str, default=None) -> Any:
-    """이벤트 딕셔너리에서 첫 번째로 값이 있는 키 반환"""
     for k in keys:
         v = ev.get(k)
         if v is not None:
@@ -188,46 +225,38 @@ def _get(ev: dict, *keys: str, default=None) -> Any:
     return default
 
 
-def _load_jsonl(path: Path) -> list[dict]:
-    records = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    return records
-
-
-def _write_jsonl(path: Path, records: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+def _is_ip(value: str) -> bool:
+    parts = value.split(".")
+    return len(parts) == 4 and all(p.isdigit() for p in parts)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Task 1 : validate_input
+# Task 1 : validate_input  [변경] S3에서 JSONL 읽어서 검증
 # ══════════════════════════════════════════════════════════════════════════════
 
 def validate_input(**ctx) -> None:
-    """입력 파일 존재 여부 및 최소 행 수 검증"""
-    if not INPUT_PATH.exists():
-        raise FileNotFoundError(f"입력 파일 없음: {INPUT_PATH}")
+    """S3에서 JSONL을 읽어 행 수 검증"""                                  # [변경]
+    skip = ctx["ti"].xcom_pull(task_ids="fetch_from_s3", key="skip")
+    if skip:
+        logger.info("S3 변경 없음 — validate 스킵")
+        return
 
-    line_count = sum(1 for _ in open(INPUT_PATH, "r", encoding="utf-8"))
+    s3 = _s3_client()
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=S3_JSONL_KEY)
+    line_count = sum(1 for line in obj["Body"].iter_lines() if line.strip())
+
     if line_count == 0:
         raise ValueError("unified_events.jsonl 가 비어 있습니다.")
 
-    logger.info("validate_input OK — 총 %d 행", line_count)
+    logger.info("validate_input OK — 총 %d 행 (s3://%s/%s)", line_count, S3_BUCKET, S3_JSONL_KEY)
     ctx["ti"].xcom_push(key="total_lines", value=line_count)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Task 2 : extract_sessions
+# Task 2 : extract_sessions  [변경] S3 읽기/쓰기
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _extract_conn(timeline: list[dict]) -> dict:
-    """zeek_conn 이벤트에서 네트워크 식별자 추출"""
     for ev in timeline:
         if ev.get("source") == "zeek_conn":
             return {
@@ -238,7 +267,6 @@ def _extract_conn(timeline: list[dict]) -> dict:
                 "proto":    ev.get("proto"),
                 "service":  ev.get("service"),
             }
-    # zeek_conn 없으면 suricata에서 폴백
     for ev in timeline:
         if ev.get("source") == "suricata":
             return {
@@ -252,30 +280,17 @@ def _extract_conn(timeline: list[dict]) -> dict:
     return {}
 
 
-def _is_ip(value: str) -> bool:
-    """단순 IPv4 판별 (entity 분류용)"""
-    parts = value.split(".")
-    return len(parts) == 4 and all(p.isdigit() for p in parts)
-
-
 def _extract_http(timeline: list[dict]) -> tuple[str | None, str | None]:
-    """zeek_http → (host, uri) 첫 번째 값
-
-    host 우선, uri는 경로 정보.
-    "1.234.184.156:443" 처럼 포트가 붙는 경우 포트를 제거하고 반환.
-    """
     for ev in timeline:
         if ev.get("source") == "zeek_http":
             host = ev.get("host")
             if host and ":" in host:
-                # "host:port" → "host"
                 host = host.rsplit(":", 1)[0]
             return host, ev.get("uri")
     return None, None
 
 
 def _extract_sni(timeline: list[dict]) -> str | None:
-    """zeek_ssl → server_name"""
     for ev in timeline:
         if ev.get("source") == "zeek_ssl":
             return ev.get("server_name")
@@ -283,7 +298,6 @@ def _extract_sni(timeline: list[dict]) -> str | None:
 
 
 def _extract_alert_stats(timeline: list[dict]) -> tuple[int, int | None]:
-    """suricata 이벤트 중 실제 alert(signature 있는 것)만 집계"""
     severities = []
     alert_count = 0
     for ev in timeline:
@@ -291,26 +305,26 @@ def _extract_alert_stats(timeline: list[dict]) -> tuple[int, int | None]:
             alert_count += 1
             if ev.get("severity") is not None:
                 severities.append(int(ev["severity"]))
-    max_sev = min(severities) if severities else None  # 숫자 낮을수록 높은 위험
+    max_sev = min(severities) if severities else None
     return alert_count, max_sev
 
 
 def extract_sessions(**ctx) -> None:
-    """
-    unified_events.jsonl 행 → session_gold 레코드 생성
-    중복 community_id는 마지막 등장 레코드로 덮어씀 (orphan은 별도 seq)
-    """
-    raw_sessions = _load_jsonl(INPUT_PATH)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    """S3에서 JSONL 읽기 → session_gold 생성 → S3 업로드"""              # [변경]
+    skip = ctx["ti"].xcom_pull(task_ids="fetch_from_s3", key="skip")
+    if skip:
+        logger.info("S3 변경 없음 — extract_sessions 스킵")
+        return
 
-    seen_cids: dict[str, str] = {}   # community_id → session_id (중복 추적)
+    raw_sessions = _s3_read_jsonl(S3_JSONL_KEY)                          # [변경]
+
+    seen_cids: dict[str, str] = {}
     orphan_idx = 0
     records: list[dict] = []
 
     for session in raw_sessions:
         cid = session.get("community_id")
 
-        # session_id 결정 (중복 community_id 재사용)
         if cid and cid in seen_cids:
             session_id = seen_cids[cid]
         else:
@@ -326,8 +340,6 @@ def extract_sessions(**ctx) -> None:
         http_host, uri = _extract_http(timeline)
         tls_sni  = _extract_sni(timeline)
         alert_count, max_severity = _extract_alert_stats(timeline)
-
-        # alert_count는 preprocess_raw 집계 값을 우선, fallback은 재계산 값
         final_alert_count = session.get("alert_count", alert_count)
 
         records.append({
@@ -349,38 +361,30 @@ def extract_sessions(**ctx) -> None:
             "flow_end":     session.get("flow_end"),
         })
 
-    _write_jsonl(SESSION_OUT, records)
-    logger.info("extract_sessions 완료 — %d 세션 → %s", len(records), SESSION_OUT)
+    _s3_write_jsonl(S3_SESSION_KEY, records)                             # [변경]
+    logger.info("extract_sessions 완료 — %d 세션 → s3://%s/%s", len(records), S3_BUCKET, S3_SESSION_KEY)
     ctx["ti"].xcom_push(key="session_count", value=len(records))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Task 3 : extract_entities
+# Task 3 : extract_entities  [변경] S3 읽기/쓰기
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_entities(**ctx) -> None:
-    """
-    session_gold + unified timeline 기반 entity 집계
+    """S3에서 session_gold + JSONL 읽기 → entity_gold 생성 → S3 업로드"""  # [변경]
+    skip = ctx["ti"].xcom_pull(task_ids="fetch_from_s3", key="skip")
+    if skip:
+        logger.info("S3 변경 없음 — extract_entities 스킵")
+        return
 
-    entity_type:
-      ip     – src_ip / dst_ip / DNS 응답 IP
-      domain – http_host / tls_sni / DNS query·answers
-      alert  – 고유 (signature_id, signature) 쌍
-    """
-    sessions  = _load_jsonl(SESSION_OUT)
-    raw       = _load_jsonl(INPUT_PATH)     # timeline 원본 (DNS answers 등)
+    sessions = _s3_read_jsonl(S3_SESSION_KEY)                           # [변경]
+    raw      = _s3_read_jsonl(S3_JSONL_KEY)                             # [변경]
 
-    # session_id → session (빠른 조회)
-    sid_map = {s["session_id"]: s for s in sessions}
-
-    # ── 집계 버킷 ─────────────────────────────────────────────────────────────
-    # ip_bucket[ip] = {first_seen, last_seen, sessions, orig_bytes, resp_bytes}
     ip_bucket:     dict[str, dict] = {}
     domain_bucket: dict[str, dict] = {}
     alert_bucket:  dict[str, dict] = {}
 
-    def _update_ip(ip: str, ts: str | None, session_id: str,
-                   orig_bytes: int = 0, resp_bytes: int = 0) -> None:
+    def _update_ip(ip, ts, session_id, orig_bytes=0, resp_bytes=0):
         if not ip:
             return
         b = ip_bucket.setdefault(ip, {
@@ -388,30 +392,24 @@ def extract_entities(**ctx) -> None:
             "sessions": set(), "orig_bytes": 0, "resp_bytes": 0,
         })
         if ts:
-            if not b["first_seen"] or ts < b["first_seen"]:
-                b["first_seen"] = ts
-            if not b["last_seen"] or ts > b["last_seen"]:
-                b["last_seen"] = ts
+            if not b["first_seen"] or ts < b["first_seen"]: b["first_seen"] = ts
+            if not b["last_seen"]  or ts > b["last_seen"]:  b["last_seen"]  = ts
         b["sessions"].add(session_id)
         b["orig_bytes"] += orig_bytes
         b["resp_bytes"] += resp_bytes
 
-    def _update_domain(domain: str, ts: str | None, session_id: str) -> None:
+    def _update_domain(domain, ts, session_id):
         if not domain:
             return
         b = domain_bucket.setdefault(domain, {
             "first_seen": ts, "last_seen": ts, "sessions": set(),
         })
         if ts:
-            if not b["first_seen"] or ts < b["first_seen"]:
-                b["first_seen"] = ts
-            if not b["last_seen"] or ts > b["last_seen"]:
-                b["last_seen"] = ts
+            if not b["first_seen"] or ts < b["first_seen"]: b["first_seen"] = ts
+            if not b["last_seen"]  or ts > b["last_seen"]:  b["last_seen"]  = ts
         b["sessions"].add(session_id)
 
-    def _update_alert(sig_id: Any, sig: str | None,
-                      category: str | None, severity: Any,
-                      ts: str | None, session_id: str) -> None:
+    def _update_alert(sig_id, sig, category, severity, ts, session_id):
         if not sig_id and not sig:
             return
         key = str(sig_id or sig)
@@ -421,20 +419,15 @@ def extract_entities(**ctx) -> None:
             "signature_id": sig_id, "category": category,
         })
         if ts:
-            if not b["first_seen"] or ts < b["first_seen"]:
-                b["first_seen"] = ts
-            if not b["last_seen"] or ts > b["last_seen"]:
-                b["last_seen"] = ts
+            if not b["first_seen"] or ts < b["first_seen"]: b["first_seen"] = ts
+            if not b["last_seen"]  or ts > b["last_seen"]:  b["last_seen"]  = ts
         b["sessions"].add(session_id)
 
-    # ── session_gold 기반 IP / Domain 집계 ───────────────────────────────────
     for sess in sessions:
         sid = sess["session_id"]
         ts_start = sess.get("flow_start")
-
         _update_ip(sess.get("src_ip"), ts_start, sid)
         _update_ip(sess.get("dst_ip"), ts_start, sid)
-        # http_host가 IP("1.2.3.4")인지 도메인인지 분기
         http_host = sess.get("http_host")
         if http_host:
             if _is_ip(http_host):
@@ -443,50 +436,40 @@ def extract_entities(**ctx) -> None:
                 _update_domain(http_host, ts_start, sid)
         _update_domain(sess.get("tls_sni"), ts_start, sid)
 
-    # ── timeline 원본 기반 세부 집계 ─────────────────────────────────────────
-    # session_id를 community_id로 역조회하기 위해 cid→sid 맵 생성
     cid_to_sid = {s["community_id"]: s["session_id"]
                   for s in sessions if s.get("community_id")}
 
     for raw_sess in raw:
         cid = raw_sess.get("community_id")
         sid = cid_to_sid.get(cid, "unknown")
-
         for ev in raw_sess.get("timeline", []):
             source = ev.get("source")
             ts = ev.get("ts")
-
             if source == "zeek_conn":
                 orig_b = int(ev.get("orig_bytes") or 0)
                 resp_b = int(ev.get("resp_bytes") or 0)
                 _update_ip(ev.get("orig_h"), ts, sid, orig_b, 0)
                 _update_ip(ev.get("resp_h"), ts, sid, 0, resp_b)
-
             elif source == "zeek_dns":
                 _update_domain(ev.get("query"), ts, sid)
-                # DNS 응답의 IP들도 entity로 등록
                 answers_raw = ev.get("answers")
                 if answers_raw:
                     for ans in str(answers_raw).split(","):
                         ans = ans.strip()
-                        # 간단한 IPv4 체크
                         parts = ans.split(".")
                         if len(parts) == 4 and all(p.isdigit() for p in parts):
                             _update_ip(ans, ts, sid)
                         elif ans:
                             _update_domain(ans, ts, sid)
-
             elif source == "suricata":
-                if ev.get("signature"):     # 실제 alert만
+                if ev.get("signature"):
                     _update_alert(
                         ev.get("signature_id"), ev.get("signature"),
                         ev.get("category"),    ev.get("severity"),
                         ts, sid,
                     )
 
-    # ── 레코드 직렬화 ─────────────────────────────────────────────────────────
     records: list[dict] = []
-
     for ip, b in ip_bucket.items():
         records.append({
             "entity_type":           "ip",
@@ -499,7 +482,6 @@ def extract_entities(**ctx) -> None:
             "signature":             None,
             "category":              None,
         })
-
     for domain, b in domain_bucket.items():
         records.append({
             "entity_type":           "domain",
@@ -512,7 +494,6 @@ def extract_entities(**ctx) -> None:
             "signature":             None,
             "category":              None,
         })
-
     for key, b in alert_bucket.items():
         records.append({
             "entity_type":           "alert",
@@ -526,39 +507,35 @@ def extract_entities(**ctx) -> None:
             "category":              b["category"],
         })
 
-    _write_jsonl(ENTITY_OUT, records)
+    _s3_write_jsonl(S3_ENTITY_KEY, records)                             # [변경]
     logger.info(
-        "extract_entities 완료 — ip:%d domain:%d alert:%d → %s",
-        len(ip_bucket), len(domain_bucket), len(alert_bucket), ENTITY_OUT,
+        "extract_entities 완료 — ip:%d domain:%d alert:%d → s3://%s/%s",
+        len(ip_bucket), len(domain_bucket), len(alert_bucket), S3_BUCKET, S3_ENTITY_KEY,
     )
     ctx["ti"].xcom_push(key="entity_count", value=len(records))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Task 4 : extract_relations
+# Task 4 : extract_relations  [변경] S3 읽기/쓰기
 # ══════════════════════════════════════════════════════════════════════════════
 
 def extract_relations(**ctx) -> None:
-    """
-    relation_gold 생성
+    """S3에서 session_gold + JSONL 읽기 → relation_gold 생성 → S3 업로드"""  # [변경]
+    skip = ctx["ti"].xcom_pull(task_ids="fetch_from_s3", key="skip")
+    if skip:
+        logger.info("S3 변경 없음 — extract_relations 스킵")
+        return
 
-    relation_type:
-      CONNECTED_TO  : ip → ip          (zeek_conn / suricata src→dst)
-      REQUESTED     : ip → domain      (http_host, tls_sni)
-      TRIGGERED     : session → alert  (suricata signature 있는 이벤트)
-      RESOLVED_BY   : domain → ip      (zeek_dns answers)
-    """
-    sessions = _load_jsonl(SESSION_OUT)
-    raw      = _load_jsonl(INPUT_PATH)
+    sessions = _s3_read_jsonl(S3_SESSION_KEY)                           # [변경]
+    raw      = _s3_read_jsonl(S3_JSONL_KEY)                             # [변경]
 
     cid_to_sid = {s["community_id"]: s["session_id"]
                   for s in sessions if s.get("community_id")}
 
-    # 중복 제거용 set
     seen: set[tuple] = set()
     records: list[dict] = []
 
-    def _add(src_type, src_val, rel, dst_type, dst_val, sid) -> None:
+    def _add(src_type, src_val, rel, dst_type, dst_val, sid):
         if not src_val or not dst_val:
             return
         key = (src_type, src_val, rel, dst_type, dst_val, sid)
@@ -574,44 +551,31 @@ def extract_relations(**ctx) -> None:
             "session_id":    sid,
         })
 
-    # ── session_gold 기반 기본 관계 ───────────────────────────────────────────
     for sess in sessions:
-        sid      = sess["session_id"]
-        src_ip   = sess.get("src_ip")
-        dst_ip   = sess.get("dst_ip")
+        sid       = sess["session_id"]
+        src_ip    = sess.get("src_ip")
+        dst_ip    = sess.get("dst_ip")
         http_host = sess.get("http_host")
-        tls_sni  = sess.get("tls_sni")
+        tls_sni   = sess.get("tls_sni")
 
-        # CONNECTED_TO
         _add("ip", src_ip, "CONNECTED_TO", "ip", dst_ip, sid)
-
-        # REQUESTED (http_host) — IP면 dst_type을 "ip"로 분기
         if http_host:
             dst_type = "ip" if _is_ip(http_host) else "domain"
             _add("ip", src_ip, "REQUESTED", dst_type, http_host, sid)
-
-        # REQUESTED (tls_sni)
         if tls_sni:
             _add("ip", src_ip, "REQUESTED", "domain", tls_sni, sid)
 
-    # ── timeline 원본 기반 세부 관계 ─────────────────────────────────────────
     for raw_sess in raw:
         cid = raw_sess.get("community_id")
         sid = cid_to_sid.get(cid, "unknown")
-
         for ev in raw_sess.get("timeline", []):
             source = ev.get("source")
-
             if source == "zeek_dns":
                 query       = ev.get("query")
                 answers_raw = ev.get("answers")
                 orig_h      = ev.get("orig_h")
-
-                # ip REQUESTED domain (DNS query)
                 if orig_h and query:
                     _add("ip", orig_h, "REQUESTED", "domain", query, sid)
-
-                # domain RESOLVED_BY ip (DNS answers)
                 if query and answers_raw:
                     for ans in str(answers_raw).split(","):
                         ans = ans.strip()
@@ -619,42 +583,45 @@ def extract_relations(**ctx) -> None:
                         if len(parts) == 4 and all(p.isdigit() for p in parts):
                             _add("domain", query, "RESOLVED_BY", "ip", ans, sid)
                         elif ans and ans != query:
-                            # CNAME chain
                             _add("domain", query, "RESOLVED_BY", "domain", ans, sid)
-
             elif source == "suricata" and ev.get("signature"):
-                # session TRIGGERED alert
                 sig_key = str(ev.get("signature_id") or ev.get("signature"))
                 _add("session", sid, "TRIGGERED", "alert", sig_key, sid)
 
-    _write_jsonl(RELATION_OUT, records)
-    logger.info("extract_relations 완료 — %d 관계 → %s", len(records), RELATION_OUT)
+    _s3_write_jsonl(S3_RELATION_KEY, records)                           # [변경]
+    logger.info("extract_relations 완료 — %d 관계 → s3://%s/%s", len(records), S3_BUCKET, S3_RELATION_KEY)
     ctx["ti"].xcom_push(key="relation_count", value=len(records))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Task 5 : report_stats
+# Task 5 : report_stats  [변경] S3에서 읽기
 # ══════════════════════════════════════════════════════════════════════════════
 
 def report_stats(**ctx) -> None:
+    skip = ctx["ti"].xcom_pull(task_ids="fetch_from_s3", key="skip")
+    if skip:
+        logger.info("S3 변경 없음 — report_stats 스킵")
+        return
+
     ti = ctx["ti"]
     total_lines    = ti.xcom_pull(task_ids="validate_input",   key="total_lines")
     session_count  = ti.xcom_pull(task_ids="extract_sessions", key="session_count")
     entity_count   = ti.xcom_pull(task_ids="extract_entities", key="entity_count")
     relation_count = ti.xcom_pull(task_ids="extract_relations", key="relation_count")
 
-    # entity 타입별 분류
+    sessions  = _s3_read_jsonl(S3_SESSION_KEY)                         # [변경]
+    entities  = _s3_read_jsonl(S3_ENTITY_KEY)                          # [변경]
+    relations = _s3_read_jsonl(S3_RELATION_KEY)                        # [변경]
+
     entity_types: dict[str, int] = defaultdict(int)
-    for e in _load_jsonl(ENTITY_OUT):
+    for e in entities:
         entity_types[e["entity_type"]] += 1
 
-    # relation 타입별 분류
     rel_types: dict[str, int] = defaultdict(int)
-    for r in _load_jsonl(RELATION_OUT):
+    for r in relations:
         rel_types[r["relation_type"]] += 1
 
-    # threat 세션 비율
-    threat_count = sum(1 for s in _load_jsonl(SESSION_OUT) if s.get("is_threat"))
+    threat_count = sum(1 for s in sessions if s.get("is_threat"))
 
     logger.info("=" * 60)
     logger.info("▶ Gold 전처리 파이프라인 완료 요약")
@@ -670,9 +637,9 @@ def report_stats(**ctx) -> None:
     for rtype, cnt in rel_types.items():
         logger.info("             ├ %-20s : %s", rtype, cnt)
     logger.info("=" * 60)
-    logger.info("  session_gold  → %s", SESSION_OUT)
-    logger.info("  entity_gold   → %s", ENTITY_OUT)
-    logger.info("  relation_gold → %s", RELATION_OUT)
+    logger.info("  session_gold  → s3://%s/%s", S3_BUCKET, S3_SESSION_KEY)
+    logger.info("  entity_gold   → s3://%s/%s", S3_BUCKET, S3_ENTITY_KEY)
+    logger.info("  relation_gold → s3://%s/%s", S3_BUCKET, S3_RELATION_KEY)
     logger.info("=" * 60)
 
 
@@ -693,9 +660,9 @@ with DAG(
     description="S3 parquet → session/entity/relation gold 전처리 (5분 주기)",
     default_args=default_args,
     start_date=datetime(2026, 1, 1),
-    schedule_interval="*/5 * * * *",    # 5분마다 실행
+    schedule="*/5 * * * *",
     catchup=False,
-    max_active_runs=1,                   # 동시 실행 1개 제한 (중복 방지)
+    max_active_runs=1,
     tags=["cti", "graph-rag", "preprocessing"],
 ) as dag:
 
@@ -732,7 +699,7 @@ with DAG(
     t_report = PythonOperator(
         task_id="report_stats",
         python_callable=report_stats,
+        outlets=[GOLD_SESSION_ASSET, GOLD_ENTITY_ASSET, GOLD_RELATION_ASSET],  # Airflow 3 Asset 선언
     )
 
-    # ── 의존성 체인 ────────────────────────────────────────────────────────────
     t_fetch >> t_convert >> t_validate >> t_sessions >> t_entities >> t_relations >> t_report
