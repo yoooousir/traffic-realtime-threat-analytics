@@ -599,4 +599,4 @@ class MergeRaw:
 
 if __name__ == "__main__":
     merger = MergeRaw(output_dir="./output")
-    merger.run_jsonl(print_sample=True)
+    merger.run_parquet(print_sample=True)
