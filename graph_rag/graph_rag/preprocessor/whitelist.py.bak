@@ -4,7 +4,7 @@ whitelist.py
 
 사용처: preprocess.py 의 MergeRaw.run() 에서
   1. src_ip 가 화이트리스트에 있으면 세션 통과 (필터링)
-  2. 화이트리스트에 없더라도 suspicion_score < SUSPICION_THRESHOLD 이면 통과
+  (삭제)2. 화이트리스트에 없더라도 suspicion_score < SUSPICION_THRESHOLD 이면 통과
 
 repeat_count_short_window 기준:
   - 단일 세션 내 alert 건수가 아닌,
@@ -67,11 +67,17 @@ def _in_whitelist(ip: str | None) -> bool:
 
 def is_whitelisted_session(session: Dict) -> bool:
     """
-    겉 틀의 src_ip(conn 기준 orig_h)만 체크.
-    timeline 순회 불필요 — conn이 단일 소스이므로 방향 반전 문제 없음.
-    suricata는 응답 방향으로 캡처되면 src_ip가 내부 IP로 뒤집힐 수 있어서 제외.
+    세션의 src_ip 가 화이트리스트에 있으면 True.
+    timeline에서 zeek_conn → suricata 순으로 IP 추출.
     """
-    return _in_whitelist(session.get("src_ip"))
+    for ev in session.get("timeline", []):
+        if ev.get("source") == "zeek_conn":
+            if _in_whitelist(ev.get("orig_h")):
+                return True
+        elif ev.get("source") == "suricata":
+            if _in_whitelist(ev.get("src_ip")):
+                return True
+    return False
 
 
 # ── repeat_count 선계산 헬퍼 ─────────────────────────────────────────────────
@@ -295,18 +301,27 @@ def extract_score_inputs(session: Dict, repeat_count: int = 1) -> Dict:
     }
 
 
-def should_include(session: Dict) -> bool:
+def should_include(session: Dict, repeat_count: int = 1) -> bool:
     """
     True  → unified_events.parquet 에 포함
     False → 필터링 (저장 안 함)
 
     판단 순서:
-      1. 화이트리스트 IP(src_ip 기준) 포함 → 제외
-      2. 그 외 → 포함
-
-    score 기반 필터는 preprocess 단계에서 사용하지 않음.
-    score 필터는 dag_neo4j_to_rag.py의 filter_whitelist 태스크에서 수행.
+      1. 화이트리스트 IP 포함 → 제외
+      (제외) 2. suspicion_score < SUSPICION_THRESHOLD → 제외
+      3. 그 외 → 포함
+    
+    (제외)
+    repeat_count : build_repeat_count_map()으로 선계산 후 주입.
+                   기본값 1 = 단독 호출 시 하위 호환.
     """
     if is_whitelisted_session(session):
         return False
-    return True
+
+    inputs = extract_score_inputs(session, repeat_count=repeat_count)
+    score = calc_suspicion_score(
+        inputs["highest_priority_classtype"],
+        inputs["highest_risk_severity"],
+        inputs["repeat_count_short_window"],
+    )
+    return score >= SUSPICION_THRESHOLD
