@@ -44,4 +44,6 @@ Thumbs.db
 tmp/
 temp/
 
+.bak
+
 !graph_rag/graph_rag/raw_data/*.log
