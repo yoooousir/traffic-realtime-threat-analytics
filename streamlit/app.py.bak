@@ -4,7 +4,15 @@ import json
 import pandas as pd
 from dotenv import load_dotenv
 import os
-import time
+import tempfile
+from pyvis.network import Network
+
+# 가져올 rag_results 패스 맞추기
+# 검색 기능 추가 (날짜 쿼리, IP 쿼리, threat_type 등 group by 해서 볼 수 있게)
+# analysis.threat_score 점수는 int점수가 아닌 string의 상중하로 표시하기 (상: 80~100, 중: 60~80, 하: 0~60) 단, 내부적으로는 threat_score 점수를 살려서 내림차순 할 때 사용.
+# "위협 분석 보고서"는 pagination으로 바꿔서 상위 10개씩 보여주고, 좌우 가운데에 투명한 화사표 버튼 만들어서 왼쪽 오른쪽으로 넘기게 하기
+# "세션 상세 정보" 밑에 라디오버튼으로 상, 중, 하 탭 만들어서 누르면 해당하는 세션들만 보이게 하기
+# "세션 상세 정보" 란은 한 탭에 20개씩 보여주되 theat_score 단위로 내림차순하고, 맨 밑 가운데에 1~n의 숫자 버튼 눌러서 숫자 버튼 누르면 해당하는 20개의 세션들만 보이게 하기
 
 load_dotenv()
 
@@ -14,17 +22,186 @@ S3_FILE_KEY = os.getenv("S3_FILE_KEY")
 
 try:
     data = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=S3_FILE_KEY)
-    # st.success("Data loaded successfully from S3!")
 except Exception as e:
     st.error(f"Error loading data from S3: {e}")
+    st.stop()
 
-
-# 오늘 날짜 (yyyy-mm-dd) 가져오기 (한국 시간대)
 timezone = 'Asia/Seoul'
 today = pd.Timestamp.now(tz=timezone).strftime('%Y-%m-%d')
 st.title(f"{today} 위협 분석 보고서")
 
-# jsonl 형식의 data 컬럼 가져오기
+
+# ── 날짜 포맷 헬퍼 ────────────────────────────────────────────────────────────
+def _fmt_ts(ts_str: str | None) -> str:
+    if not ts_str:
+        return "–"
+    try:
+        return pd.Timestamp(ts_str).tz_convert("Asia/Seoul").strftime("%m-%d %H:%M:%S")
+    except Exception:
+        return ts_str[:19].replace("T", " ")
+
+
+def _fmt_bytes(b) -> str:
+    if b is None:
+        return "–"
+    b = int(b)
+    if b >= 1_048_576:
+        return f"{b / 1_048_576:.1f} MB"
+    if b >= 1024:
+        return f"{b / 1024:.1f} KB"
+    return f"{b} B"
+
+
+# ── 관계 유형 한글 레이블 ─────────────────────────────────────────────────────
+REL_LABEL = {
+    "ORIGINATED_FROM": "출발지 IP",
+    "CONNECTED_TO":    "목적지 IP",
+    "TRIGGERED":       "Alert 발생",
+    "ENCRYPTED_WITH":  "암호화 방식",
+}
+
+
+# ── neighbor 카드 렌더링 ──────────────────────────────────────────────────────
+def _render_neighbor_cards(neighbors: list[dict]):
+    if not neighbors:
+        st.caption("Neo4j 연관 데이터 없음 (신규 세션)")
+        return
+
+    groups: dict[str, list[dict]] = {}
+    for nb in neighbors:
+        rt = nb.get("rel_type", "UNKNOWN")
+        groups.setdefault(rt, []).append(nb)
+
+    for rel_type, nbs in groups.items():
+        section_title = REL_LABEL.get(rel_type, rel_type)
+        st.markdown(f"**{section_title}**")
+
+        for nb in nbs:
+            node_label = (nb.get("node_labels") or ["?"])[0]
+            value      = nb.get("node_value", "–")
+
+            with st.container(border=True):
+                if node_label == "IP":
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.markdown(f"`{value}`")
+                        st.caption(f"연관 세션 수: **{nb.get('related_session_count', '–')}**")
+                    with col_b:
+                        st.caption(f"첫 등장: {_fmt_ts(nb.get('first_seen'))}")
+                        st.caption(f"최근 등장: {_fmt_ts(nb.get('last_seen'))}")
+                    orig = _fmt_bytes(nb.get("total_orig_bytes"))
+                    resp = _fmt_bytes(nb.get("total_resp_bytes"))
+                    st.caption(f"송신: {orig} / 수신: {resp}")
+
+                elif node_label == "Alert":
+                    sig      = nb.get("signature", "–")
+                    category = nb.get("category", "–")
+                    count    = nb.get("related_session_count", "–")
+                    first    = _fmt_ts(nb.get("first_seen"))
+                    last     = _fmt_ts(nb.get("last_seen"))
+                    st.markdown(f"`{sig}`")
+                    st.caption(f"카테고리: {category}")
+                    st.caption(f"영향 세션 수: **{count}** | 첫 발생: {first} | 최근 발생: {last}")
+
+                elif node_label == "Cipher":
+                    st.markdown(f"`{value}`")
+
+                else:
+                    st.markdown(f"`{node_label}` : `{value}`")
+
+
+# ── pyvis 그래프 시각화 ───────────────────────────────────────────────────────
+NODE_COLOR = {
+    "Session": "#4A90D9",
+    "IP":      "#F5A623",
+    "Alert":   "#D0021B",
+    "Cipher":  "#7ED321",
+}
+
+
+def _render_graph(session: dict, neighbors: list[dict]):
+    net = Network(height="420px", width="100%", bgcolor="#1e1e1e", font_color="white",
+                  directed=True)
+    net.barnes_hut(gravity=-8000, central_gravity=0.3, spring_length=120)
+
+    session_id = session.get("session_id", "session")
+
+    net.add_node(
+        session_id,
+        label=f"{session_id}\n{session.get('src_ip','?')} → {session.get('dest_ip','?')}",
+        color=NODE_COLOR["Session"],
+        size=28,
+        title=(
+            f"세션 ID: {session_id}\n"
+            f"출발지: {session.get('src_ip')} : {session.get('src_port')}\n"
+            f"목적지: {session.get('dest_ip')} : {session.get('dest_port')}\n"
+            f"프로토콜: {session.get('proto')}\n"
+            f"Alert 수: {session.get('alert_count')}\n"
+            f"최고 위험도: {session.get('max_severity')}\n"
+            f"연결 상태: {session.get('conn_state')}"
+        ),
+        shape="box",
+    )
+
+    added_nodes: set[str] = set()
+
+    for nb in neighbors:
+        node_label = (nb.get("node_labels") or ["?"])[0]
+        node_value = str(nb.get("node_value") or "?")
+        rel_type   = nb.get("rel_type", "")
+        node_id    = f"{node_label}_{node_value}"
+        color      = NODE_COLOR.get(node_label, "#888888")
+
+        if node_label == "IP":
+            tooltip = (
+                f"IP: {node_value}\n"
+                f"연관 세션: {nb.get('related_session_count', '–')}\n"
+                f"첫 등장: {_fmt_ts(nb.get('first_seen'))}\n"
+                f"최근 등장: {_fmt_ts(nb.get('last_seen'))}\n"
+                f"송신: {_fmt_bytes(nb.get('total_orig_bytes'))} / "
+                f"수신: {_fmt_bytes(nb.get('total_resp_bytes'))}"
+            )
+            display_label = node_value
+        elif node_label == "Alert":
+            sig       = nb.get("signature", node_value)
+            short_sig = sig if len(sig) <= 30 else sig[:28] + "…"
+            tooltip = (
+                f"시그니처: {sig}\n"
+                f"카테고리: {nb.get('category', '–')}\n"
+                f"영향 세션: {nb.get('related_session_count', '–')}\n"
+                f"첫 발생: {_fmt_ts(nb.get('first_seen'))}\n"
+                f"최근 발생: {_fmt_ts(nb.get('last_seen'))}"
+            )
+            display_label = short_sig
+        else:
+            tooltip       = f"{node_label}: {node_value}"
+            display_label = node_value
+
+        if node_id not in added_nodes:
+            net.add_node(
+                node_id,
+                label=display_label,
+                color=color,
+                size=20,
+                title=tooltip,
+                shape="ellipse",
+            )
+            added_nodes.add(node_id)
+
+        edge_label = REL_LABEL.get(rel_type, rel_type)
+        if rel_type in ("ORIGINATED_FROM", "ENCRYPTED_WITH"):
+            net.add_edge(node_id, session_id, label=edge_label, color="#aaaaaa", font_size=9)
+        else:
+            net.add_edge(session_id, node_id, label=edge_label, color="#aaaaaa", font_size=9)
+
+    with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as f:
+        net.save_graph(f.name)
+        html_content = open(f.name).read()
+
+    st.components.v1.html(html_content, height=440, scrolling=False)
+
+
+# ── 메인 렌더링 ───────────────────────────────────────────────────────────────
 try:
     jsonl_data = data['Body'].read().decode('utf-8').splitlines()
     records = [json.loads(line) for line in jsonl_data if line.strip()]
@@ -34,8 +211,9 @@ try:
     else:
         rows = []
         for r in records:
-            session  = r.get("session", {})
-            analysis = r.get("analysis", {})
+            session   = r.get("session", {})
+            analysis  = r.get("analysis", {})
+            neighbors = r.get("neighbors", [])
             threat_score = analysis.get("threat_score", 0) / 80 * 100
             rows.append({
                 "uid":                         r.get("uid"),
@@ -44,15 +222,14 @@ try:
                 "analysis.threat_type":        analysis.get("threat_type"),
                 "analysis.summary":            analysis.get("summary"),
                 "analysis.recommended_action": analysis.get("recommended_action"),
-                #"analysis.threat_score":       analysis.get("threat_score"),
                 "analysis.threat_score":       threat_score,
                 "_session_meta":               session,
+                "_neighbors":                  neighbors,
             })
 
         df = pd.DataFrame(rows)
         df = df.sort_values(by="analysis.threat_score", ascending=False).reset_index(drop=True)
 
-        # 요약 테이블 (session 메타 제외)
         display_cols = [c for c in df.columns if not c.startswith("_")]
         st.dataframe(df[display_cols], use_container_width=True)
 
@@ -66,16 +243,30 @@ try:
                 f"[{round(row['analysis.threat_score'], 1)}점]"
             )
             with st.expander(label):
+                neighbors = row["_neighbors"] or []
+                session   = row["_session_meta"]
+
+                # 상단: 분석결과 / 세션정보
                 col1, col2 = st.columns(2)
                 with col1:
                     st.markdown("**분석 결과**")
                     st.write("**위협 유형:**", row["analysis.threat_type"])
-                    st.write("**위협 점수:**", row["analysis.threat_score"])
+                    st.write("**위협 점수:**", round(row["analysis.threat_score"], 1))
                     st.write("**요약:**", row["analysis.summary"])
                     st.write("**권고 조치:**", row["analysis.recommended_action"])
                 with col2:
                     st.markdown("**세션 정보**")
-                    st.json(row["_session_meta"])
+                    st.json(session)
+
+                # 하단: 연관 흐름 정보
+                if neighbors:
+                    st.divider()
+                    st.markdown("**연관 흐름 정보** (Neo4j 1-hop)")
+                    tab_card, tab_graph = st.tabs(["📋 목록", "🕸️ 그래프"])
+                    with tab_card:
+                        _render_neighbor_cards(neighbors)
+                    with tab_graph:
+                        _render_graph(session, neighbors)
 
 except Exception as e:
     st.error(f"Error processing data: {e}")
