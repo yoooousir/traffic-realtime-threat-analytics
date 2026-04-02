@@ -27,7 +27,7 @@ AUTO_REFRESH_SEC = 30
 
 # ── 페이지 설정 ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="CTI 위협 분석 대시보드",
+    page_title="Threat Detection Dashboard",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
