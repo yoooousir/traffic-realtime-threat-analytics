@@ -414,7 +414,7 @@ with st.sidebar:
     # 동적 위협 유형 리스트
     threat_types = ["전체"] + sorted(df_all["threat_type"].dropna().unique().tolist())
     search_threat = st.selectbox("위협 유형", options=threat_types)
-    
+
     search_keyword   = st.text_input("키워드 (요약/권고)", placeholder="예: 포트스캔")
     search_grade     = st.multiselect(
         "위협 등급",
@@ -433,14 +433,14 @@ with st.sidebar:
 # 데이터 로드 + 필터링
 # ══════════════════════════════════════════════════════════════════════════════
 
-with st.spinner(f"{date_str} 데이터 로드 중..."):
-    raw_records = load_all_rag_results(date_str)
+# with st.spinner(f"{date_str} 데이터 로드 중..."):
+#     raw_records = load_all_rag_results(date_str)
 
-if not raw_records:
-    st.info(f"📭 {date_str} 날짜의 RAG 결과가 없습니다.")
-    st.stop()
+# if not raw_records:
+#     st.info(f"📭 {date_str} 날짜의 RAG 결과가 없습니다.")
+#     st.stop()
 
-df_all = build_dataframe(raw_records)
+# df_all = build_dataframe(raw_records)
 
 # 필터 적용
 df_filtered = df_all.copy()
