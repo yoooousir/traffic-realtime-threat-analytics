@@ -150,8 +150,7 @@ def _grade_badge(grade: str) -> str:
 def _normalize_score(raw_score) -> float:
     """threat_score(0~100 범위) 정규화."""
     try:
-        s = float(raw_score)
-        # 기존 코드에서 /80*100 했으므로 그대로 사용
+        s = float(raw_score) / 80 * 100
         return min(s, 100.0)
     except Exception:
         return 0.0
@@ -381,9 +380,9 @@ def _render_session_expander(row: pd.Series, idx: int):
 # ══════════════════════════════════════════════════════════════════════════════
 # 사이드바: 날짜 선택 + 검색 필터
 # ══════════════════════════════════════════════════════════════════════════════
-
+# 사이드바 상단: 날짜 선택만 먼저
 with st.sidebar:
-    st.markdown("### 🛡️ CTI 대시보드")
+    st.markdown("### 🛡️ Threat Detection Dashboard")
     st.divider()
 
     # 날짜 선택
@@ -395,18 +394,27 @@ with st.sidebar:
     )
     date_str = selected_date.strftime("%Y-%m-%d")
 
+# ── 데이터 로드 ───────────────────────────────────────────────────────────────
+with st.spinner(f"{date_str} 데이터 로드 중..."):
+    raw_records = load_all_rag_results(date_str)
+
+if not raw_records:
+    st.info(f"📭 {date_str} 날짜의 RAG 결과가 없습니다.")
+    st.stop()
+
+df_all = build_dataframe(raw_records)
+
+# ── 사이드바 하단 (동적 필터) ─────────────────────────────────────────────────
+with st.sidebar:
     st.divider()
     st.markdown("### 🔍 검색 필터")
 
     search_ip        = st.text_input("IP 주소", placeholder="예: 192.168.1.1")
-    search_threat    = st.selectbox(
-        "위협 유형",
-        options=["전체", "Web Application Attack", "A Network Trojan was detected",
-                 "Misc Attack", "Potentially Bad Traffic", "Detection of a Network Scan",
-                 "Not Suspicious Traffic", "Attempted Administrator Privilege Gain",
-                 "Attempted User Privilege Gain", "Generic Protocol Command Decode",
-                 "Malware Command and Control Activity Detected", "Unknown Traffic"],
-    )
+    
+    # 동적 위협 유형 리스트
+    threat_types = ["전체"] + sorted(df_all["threat_type"].dropna().unique().tolist())
+    search_threat = st.selectbox("위협 유형", options=threat_types)
+    
     search_keyword   = st.text_input("키워드 (요약/권고)", placeholder="예: 포트스캔")
     search_grade     = st.multiselect(
         "위협 등급",
