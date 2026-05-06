@@ -1,9 +1,8 @@
 """
-CTI 위협 분석 대시보드
+Threat Detection Dashboard
 - S3 rag_result/dt={today}/ 하위 전체 JSONL 실시간 로드 (30초 자동 갱신)
-- 검색: 날짜, IP, threat_type, 키워드
-- 위협 점수 상/중/하 탭 분류 (상: 80+, 중: 60~80, 하: ~60)
-- 위협 분석 보고서: pagination 10개씩, 화살표 버튼
+- 검색: 날짜(datetime), IP, threat_type, 키워드
+- 위협 점수 상/중/하 탭 분류 (상: 80+, 중: 60~80, 하: 60-)
 - 세션 상세 정보: 상/중/하 라디오 필터, threat_score 내림차순, 20개씩 숫자 버튼 페이지네이션
 """
 
@@ -18,14 +17,21 @@ import streamlit as st
 from dotenv import load_dotenv
 from pyvis.network import Network
 
-# ── 환경 변수 ─────────────────────────────────────────────────────────────────
 load_dotenv()
-S3_BUCKET_NAME  = os.getenv("S3_BUCKET_NAME", "malware-project-bucket")
-S3_RAG_PREFIX   = os.getenv("S3_RAG_PREFIX", "rag_result")
-KST_TZ          = "Asia/Seoul"
+
+def _require_env(key: str) -> str:
+    val = os.getenv(key)
+    if not val:
+        raise EnvironmentError(f"필수 환경변수 누락: {key}")
+    return val
+
+S3_BUCKET_NAME  = _require_env("S3_BUCKET_NAME")
+S3_RAG_PREFIX   = _require_env("S3_RAG_PREFIX")
+KST_TZ          = os.getenv("KST_TZ", "Asia/Seoul")
+
 AUTO_REFRESH_SEC = 30
 
-# ── 페이지 설정 ───────────────────────────────────────────────────────────────
+# 페이지 설정
 st.set_page_config(
     page_title="Threat Detection Dashboard",
     page_icon="🛡️",
@@ -68,10 +74,8 @@ code, pre, .mono {
 """, unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# S3 데이터 로드
-# ══════════════════════════════════════════════════════════════════════════════
 
+# S3 데이터 로드
 @st.cache_data(ttl=AUTO_REFRESH_SEC)
 def load_all_rag_results(date_str: str) -> list[dict]:
     """
@@ -82,6 +86,7 @@ def load_all_rag_results(date_str: str) -> list[dict]:
     prefix    = f"{S3_RAG_PREFIX}/dt={date_str}/"
     paginator = s3.get_paginator("list_objects_v2")
 
+    # 해당 날짜 prefix 하위의 .jsonl 키 목록 수집
     keys: list[str] = []
     try:
         for page in paginator.paginate(Bucket=S3_BUCKET_NAME, Prefix=prefix):
@@ -93,8 +98,9 @@ def load_all_rag_results(date_str: str) -> list[dict]:
         st.error(f"S3 목록 조회 실패: {e}")
         return []
 
+    # 각 파일을 줄 단위로 파싱하여 레코드 누적
     records: list[dict] = []
-    for key in sorted(keys):
+    for key in sorted(keys): # 시간순 정렬(파일명이 hour=*_minute=*_rag_results.jsonl 패턴)
         try:
             obj  = s3.get_object(Bucket=S3_BUCKET_NAME, Key=key)
             body = obj["Body"].read().decode("utf-8").splitlines()
@@ -107,20 +113,21 @@ def load_all_rag_results(date_str: str) -> list[dict]:
     return records
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 헬퍼 함수
-# ══════════════════════════════════════════════════════════════════════════════
 
+# 헬퍼 함수
 def _fmt_ts(ts_str) -> str:
+    # iso 타임스탬프 -> kst mm-dd hh:mm:ss 포맷 문자열로 변환
     if not ts_str:
         return "–"
     try:
         return pd.Timestamp(ts_str).tz_convert(KST_TZ).strftime("%m-%d %H:%M:%S")
     except Exception:
+        # 파싱 실패 시 앞 19자만 반환 (T 제거)
         return str(ts_str)[:19].replace("T", " ")
 
 
 def _fmt_bytes(b) -> str:
+    # 바이트 수 -> 사람이 읽기 쉬운 단위 (B, KB, MB)로 변환
     if b is None:
         return "–"
     try:
@@ -135,6 +142,7 @@ def _fmt_bytes(b) -> str:
 
 
 def _score_to_grade(score: float) -> str:
+    # 정규화된 위험 점수(0~100) -> 등급 상/중/하 변환
     if score >= 80:
         return "상"
     if score >= 60:
@@ -143,19 +151,21 @@ def _score_to_grade(score: float) -> str:
 
 
 def _grade_badge(grade: str) -> str:
+    # 위협 등급 문자열 -> html 배치 태그 반환 (css 클래스 매핑)
     cls = {"상": "badge-high", "중": "badge-mid", "하": "badge-low"}.get(grade, "badge-low")
     return f'<span class="{cls}">{grade}</span>'
 
 
 def _normalize_score(raw_score) -> float:
-    """threat_score(0~100 범위) 정규화."""
+    #llm이 반환한 raw threat_score 을 0~100 범위로 정규화.
+    # llm 점수 기준 80점 만점을 100점으로 환산
     try:
         s = float(raw_score) / 80 * 100
         return min(s, 100.0)
     except Exception:
         return 0.0
 
-
+# 관계 유형 라벨 (neo4j 앳지 타입 기반)
 REL_LABEL = {
     "ORIGINATED_FROM": "출발지 IP",
     "CONNECTED_TO":    "목적지 IP",
@@ -165,6 +175,7 @@ REL_LABEL = {
     "REQUESTED":       "요청 도메인",
 }
 
+# 노드 유형별 색상 지정
 NODE_COLOR = {
     "Session": "#4A90D9",
     "IP":      "#F5A623",
@@ -174,10 +185,8 @@ NODE_COLOR = {
 }
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 데이터 가공
-# ══════════════════════════════════════════════════════════════════════════════
 
+# 데이터 가공
 def build_dataframe(records: list[dict]) -> pd.DataFrame:
     rows = []
     for r in records:
@@ -213,27 +222,29 @@ def build_dataframe(records: list[dict]) -> pd.DataFrame:
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 컴포넌트: neighbor 카드
-# ══════════════════════════════════════════════════════════════════════════════
 
+# 컴포넌트: neighbor 카드
 def _render_neighbor_cards(neighbors: list[dict]):
     if not neighbors:
         st.caption("Neo4j 연관 데이터 없음 (신규 세션)")
         return
 
+    # 관계 유형별로 그룹핑
     groups: dict[str, list[dict]] = {}
     for nb in neighbors:
         rt = nb.get("rel_type", "UNKNOWN")
         groups.setdefault(rt, []).append(nb)
 
+    # 관계 유형별로 카드 표시
     for rel_type, nbs in groups.items():
+        # 관계 유형 라벨 표시
         st.markdown(f"**{REL_LABEL.get(rel_type, rel_type)}**")
         for nb in nbs:
             node_label = (nb.get("node_labels") or ["?"])[0]
             value      = nb.get("node_value", "–")
             with st.container(border=True):
                 if node_label == "IP":
+                    # c1: IP 주소 + 연관 세션 수, c2: 첫/최근 등장 시각, 하단: 송수신 바이트
                     c1, c2 = st.columns(2)
                     with c1:
                         st.markdown(f"`{value}`")
@@ -259,22 +270,29 @@ def _render_neighbor_cards(neighbors: list[dict]):
                     st.markdown(f"`{node_label}` : `{value}`")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 컴포넌트: pyvis 그래프
-# ══════════════════════════════════════════════════════════════════════════════
 
+# 컴포넌트: pyvis 그래프
 def _render_graph(session: dict, neighbors: list[dict]):
+    # pyvis 네트워크 그래프 초기화
     net = Network(
         height="420px", width="100%",
         bgcolor="#1a1a2e", font_color="white", directed=True,
     )
+    # 그래프 레이아웃 조정 (Barnes-Hut)
+    ### gravity: 음수값으로 클수록 노드 간 반발력 증가 (밀집 방지)
+    ### central_gravity: 중심으로 끌어당기는 힘 (0~1, 클수록 중앙 집중)
+    ### spring_length: 노드 간 기본 간격 (길수록 넓게 배치)
     net.barnes_hut(gravity=-8000, central_gravity=0.3, spring_length=120)
+
 
     session_id = session.get("session_id", "session")
     net.add_node(
+        # 세션 노드 추가
         session_id,
+        # src_ip → dest_ip 형태로 노드 라벨링
         label=f"{session_id}\n{session.get('src_ip','?')} → {session.get('dest_ip','?')}",
         color=NODE_COLOR["Session"], size=28,
+        # 툴팁에 세션 상세 정보 포함(세션 위에 마우스 오버 시 표시)
         title=(
             f"세션 ID: {session_id}\n"
             f"출발지: {session.get('src_ip')} : {session.get('src_port')}\n"
@@ -287,6 +305,7 @@ def _render_graph(session: dict, neighbors: list[dict]):
         shape="box",
     )
 
+    # 추가된 노드 tracking 위해 set 사용 (중복 방지)
     added: set[str] = set()
     for nb in neighbors:
         node_label = (nb.get("node_labels") or ["?"])[0]
@@ -301,8 +320,6 @@ def _render_graph(session: dict, neighbors: list[dict]):
                 f"연관 세션: {nb.get('related_session_count','–')}\n"
                 f"첫 등장: {_fmt_ts(nb.get('first_seen'))}\n"
                 f"최근 등장: {_fmt_ts(nb.get('last_seen'))}\n"
-                f"송신: {_fmt_bytes(nb.get('total_orig_bytes'))} / "
-                f"수신: {_fmt_bytes(nb.get('total_resp_bytes'))}"
             )
             display_label = node_value
         elif node_label == "Alert":
@@ -338,10 +355,8 @@ def _render_graph(session: dict, neighbors: list[dict]):
     st.components.v1.html(html_content, height=440, scrolling=False)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 컴포넌트: 세션 expander
-# ══════════════════════════════════════════════════════════════════════════════
 
+# 컴포넌트: 세션 expander
 def _render_session_expander(row: pd.Series, idx: int):
     grade        = row["grade"]
     badge_html   = _grade_badge(grade)
@@ -377,10 +392,8 @@ def _render_session_expander(row: pd.Series, idx: int):
                 _render_graph(session, neighbors)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
 # 사이드바: 날짜 선택 + 검색 필터
-# ══════════════════════════════════════════════════════════════════════════════
-# 사이드바 상단: 날짜 선택만 먼저
+### 사이드바 상단: 날짜 선택만 먼저
 with st.sidebar:
     st.markdown("### 🛡️ Threat Detection Dashboard")
     st.divider()
@@ -394,7 +407,7 @@ with st.sidebar:
     )
     date_str = selected_date.strftime("%Y-%m-%d")
 
-# ── 데이터 로드 ───────────────────────────────────────────────────────────────
+# 데이터 로드
 with st.spinner(f"{date_str} 데이터 로드 중..."):
     raw_records = load_all_rag_results(date_str)
 
@@ -404,7 +417,7 @@ if not raw_records:
 
 df_all = build_dataframe(raw_records)
 
-# ── 사이드바 하단 (동적 필터) ─────────────────────────────────────────────────
+# 사이드바 하단 (동적 필터)
 with st.sidebar:
     st.divider()
     st.markdown("### 🔍 검색 필터")
@@ -499,7 +512,7 @@ st.divider()
 # 위협 유형 분포 (Group By)
 # ══════════════════════════════════════════════════════════════════════════════
 
-with st.expander("📊 위협 유형 분포 보기", expanded=False):
+with st.expander("📊 위협 유형 분포", expanded=False):
     if not df_filtered.empty:
         threat_counts = (
             df_filtered.groupby("threat_type")
